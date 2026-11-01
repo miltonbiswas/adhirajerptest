@@ -1,0 +1,674 @@
+use axum::{
+    Json, Router,
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::get,
+};
+use chrono::NaiveDate;
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use sqlx::{FromRow, PgPool};
+use uuid::Uuid;
+
+pub fn router() -> Router<PgPool> {
+    Router::new()
+        .route("/", get(list_purchases).post(create_purchase))
+        .route("/{id}", get(get_purchase))
+}
+
+#[derive(Debug, Serialize)]
+pub struct ApiError {
+    error: String,
+}
+
+impl ApiError {
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            error: message.into(),
+        }
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            error: message.into(),
+        }
+    }
+
+    fn internal(error: impl std::fmt::Display) -> Self {
+        tracing::error!("Purchase API error: {error}");
+        Self {
+            error: "Purchase operation failed. Check backend logs.".to_owned(),
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let status = if self.error == "Purchase not found" {
+            StatusCode::NOT_FOUND
+        } else if self.error.starts_with("Purchase operation failed") {
+            StatusCode::INTERNAL_SERVER_ERROR
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+
+        (status, Json(self)).into_response()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PurchaseListQuery {
+    pub search: Option<String>,
+    pub status: Option<String>,
+    pub page: Option<i64>,
+    pub limit: Option<i64>,
+    pub tax_mode: String,
+    pub tax_type: String,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+pub struct PurchaseListItem {
+    pub id: Uuid,
+    pub purchase_number: String,
+    pub supplier_id: Uuid,
+    pub supplier_name: String,
+    pub supplier_invoice_number: String,
+    pub invoice_date: NaiveDate,
+    pub due_date: Option<NaiveDate>,
+    pub status: String,
+    pub grand_total: Decimal,
+    pub paid_amount: Decimal,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PurchaseListResponse {
+    pub data: Vec<PurchaseListItem>,
+    pub page: i64,
+    pub limit: i64,
+    pub total: i64,
+}
+
+pub async fn list_purchases(
+    State(pool): State<PgPool>,
+    Query(params): Query<PurchaseListQuery>,
+) -> Result<Json<PurchaseListResponse>, ApiError> {
+    let page = params.page.unwrap_or(1).max(1);
+    let limit = params.limit.unwrap_or(25).clamp(1, 100);
+    let offset = (page - 1) * limit;
+
+    let search = params.search.unwrap_or_default().trim().to_owned();
+    let pattern = format!("%{search}%");
+
+    let status = params
+        .status
+        .unwrap_or_else(|| "ALL".to_owned())
+        .to_uppercase();
+
+    if !["ALL", "DRAFT", "POSTED", "CANCELLED"].contains(&status.as_str()) {
+        return Err(ApiError::bad_request("Invalid purchase status filter"));
+    }
+
+    let total: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM purchases p
+        JOIN parties s ON s.id = p.supplier_id
+        WHERE
+            ($1 = '' OR
+                p.purchase_number ILIKE $2 OR
+                p.supplier_invoice_number ILIKE $2 OR
+                s.name ILIKE $2)
+            AND ($3 = 'ALL' OR p.status = $3)
+        "#,
+    )
+    .bind(&search)
+    .bind(&pattern)
+    .bind(&status)
+    .fetch_one(&pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let data = sqlx::query_as::<_, PurchaseListItem>(
+        r#"
+        SELECT
+            p.id,
+            p.purchase_number,
+            p.supplier_id,
+            s.name AS supplier_name,
+            p.supplier_invoice_number,
+            p.invoice_date,
+            p.due_date,
+            p.status,
+            p.grand_total,
+            p.paid_amount,
+            p.created_at
+        FROM purchases p
+        JOIN parties s ON s.id = p.supplier_id
+        WHERE
+            ($1 = '' OR
+                p.purchase_number ILIKE $2 OR
+                p.supplier_invoice_number ILIKE $2 OR
+                s.name ILIKE $2)
+            AND ($3 = 'ALL' OR p.status = $3)
+        ORDER BY p.invoice_date DESC, p.created_at DESC
+        LIMIT $4 OFFSET $5
+        "#,
+    )
+    .bind(&search)
+    .bind(&pattern)
+    .bind(&status)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    Ok(Json(PurchaseListResponse {
+        data,
+        page,
+        limit,
+        total,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreatePurchaseRequest {
+    pub supplier_id: Uuid,
+    pub supplier_invoice_number: String,
+    pub invoice_date: NaiveDate,
+    pub due_date: Option<NaiveDate>,
+    pub notes: Option<String>,
+    pub items: Vec<CreatePurchaseItemRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreatePurchaseItemRequest {
+    pub product_id: Uuid,
+    pub batch_number: String,
+    pub manufacturing_date: Option<NaiveDate>,
+    pub expiry_date: Option<NaiveDate>,
+    pub quantity: Decimal,
+    pub free_quantity: Option<Decimal>,
+    pub purchase_rate: Decimal,
+    pub mrp: Decimal,
+    pub selling_rate: Option<Decimal>,
+    pub discount_percent: Option<Decimal>,
+    pub gst_rate: Decimal,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+pub struct PurchaseDetail {
+    pub id: Uuid,
+    pub purchase_number: String,
+    pub supplier_id: Uuid,
+    pub supplier_name: String,
+    pub supplier_invoice_number: String,
+    pub invoice_date: NaiveDate,
+    pub due_date: Option<NaiveDate>,
+    pub status: String,
+    pub subtotal: Decimal,
+    pub discount_amount: Decimal,
+    pub taxable_amount: Decimal,
+    pub tax_amount: Decimal,
+    pub other_charges: Decimal,
+    pub round_off: Decimal,
+    pub grand_total: Decimal,
+    pub paid_amount: Decimal,
+    pub notes: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+pub struct PurchaseItemDetail {
+    pub id: Uuid,
+    pub line_number: i32,
+    pub product_id: Uuid,
+    pub product_name: String,
+    pub sku: String,
+    pub batch_id: Option<Uuid>,
+    pub batch_number: String,
+    pub manufacturing_date: Option<NaiveDate>,
+    pub expiry_date: Option<NaiveDate>,
+    pub quantity: Decimal,
+    pub free_quantity: Decimal,
+    pub purchase_rate: Decimal,
+    pub mrp: Decimal,
+    pub selling_rate: Decimal,
+    pub discount_percent: Decimal,
+    pub discount_amount: Decimal,
+    pub gst_rate: Decimal,
+    pub taxable_amount: Decimal,
+    pub cgst_amount: Decimal,
+    pub sgst_amount: Decimal,
+    pub igst_amount: Decimal,
+    pub total_amount: Decimal,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PurchaseDetailResponse {
+    pub purchase: PurchaseDetail,
+    pub items: Vec<PurchaseItemDetail>,
+}
+
+pub async fn get_purchase(
+    State(pool): State<PgPool>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<PurchaseDetailResponse>, ApiError> {
+    let purchase = sqlx::query_as::<_, PurchaseDetail>(
+        r#"
+        SELECT
+            p.id,
+            p.purchase_number,
+            p.supplier_id,
+            s.name AS supplier_name,
+            p.supplier_invoice_number,
+            p.invoice_date,
+            p.due_date,
+            p.status,
+            p.subtotal,
+            p.discount_amount,
+            p.taxable_amount,
+            p.tax_amount,
+            p.other_charges,
+            p.round_off,
+            p.grand_total,
+            p.paid_amount,
+            p.notes,
+            p.created_at
+        FROM purchases p
+        JOIN parties s ON s.id = p.supplier_id
+        WHERE p.id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(ApiError::internal)?
+    .ok_or_else(|| ApiError::not_found("Purchase not found"))?;
+
+    let items = sqlx::query_as::<_, PurchaseItemDetail>(
+        r#"
+        SELECT
+            pi.id,
+            pi.line_number,
+            pi.product_id,
+            p.name AS product_name,
+            p.sku,
+            pi.batch_id,
+            pi.batch_number,
+            pi.manufacturing_date,
+            pi.expiry_date,
+            pi.quantity,
+            pi.free_quantity,
+            pi.purchase_rate,
+            pi.mrp,
+            pi.selling_rate,
+            pi.discount_percent,
+            pi.discount_amount,
+            pi.gst_rate,
+            pi.taxable_amount,
+            pi.cgst_amount,
+            pi.sgst_amount,
+            pi.igst_amount,
+            pi.total_amount
+        FROM purchase_items pi
+        JOIN products p ON p.id = pi.product_id
+        WHERE pi.purchase_id = $1
+        ORDER BY pi.line_number
+        "#,
+    )
+    .bind(id)
+    .fetch_all(&pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    Ok(Json(PurchaseDetailResponse { purchase, items }))
+}
+
+pub async fn create_purchase(
+    State(pool): State<PgPool>,
+    Json(request): Json<CreatePurchaseRequest>,
+) -> Result<(StatusCode, Json<PurchaseDetailResponse>), ApiError> {
+    let supplier_invoice_number = request.supplier_invoice_number.trim().to_owned();
+
+    if supplier_invoice_number.is_empty() {
+        return Err(ApiError::bad_request(
+            "Supplier invoice number is required",
+        ));
+    }
+
+    if request.items.is_empty() {
+        return Err(ApiError::bad_request(
+            "At least one purchase item is required",
+        ));
+    }
+
+    if request.items.len() > 500 {
+        return Err(ApiError::bad_request(
+            "A purchase cannot contain more than 500 lines",
+        ));
+    }
+
+    // Validate input before starting the database transaction.
+    for item in &request.items {
+        if item.batch_number.trim().is_empty() {
+            return Err(ApiError::bad_request("Batch number is required"));
+        }
+
+        if item.quantity <= Decimal::ZERO
+            || item.purchase_rate < Decimal::ZERO
+            || item.mrp < Decimal::ZERO
+            || item.gst_rate < Decimal::ZERO
+            || item.gst_rate > Decimal::ONE_HUNDRED
+        {
+            return Err(ApiError::bad_request(
+                "Invalid quantity, rate, MRP or GST rate",
+            ));
+        }
+
+        if item
+            .manufacturing_date
+            .zip(item.expiry_date)
+            .is_some_and(|(mfg, exp)| mfg > exp)
+        {
+            return Err(ApiError::bad_request(
+                "Manufacturing date cannot be after expiry date",
+            ));
+        }
+
+        let free_quantity = item.free_quantity.unwrap_or(Decimal::ZERO);
+        let discount_percent = item.discount_percent.unwrap_or(Decimal::ZERO);
+
+        if free_quantity < Decimal::ZERO
+            || discount_percent < Decimal::ZERO
+            || discount_percent > Decimal::ONE_HUNDRED
+        {
+            return Err(ApiError::bad_request(
+                "Invalid free quantity or discount percentage",
+            ));
+        }
+    }
+
+    let mut tx = pool.begin().await.map_err(ApiError::internal)?;
+
+    // Lock the supplier row and ensure the party has the supplier role.
+    let supplier_exists: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM parties p
+            JOIN party_roles pr ON pr.party_id = p.id
+            WHERE p.id = $1
+              AND p.is_active = TRUE
+              AND pr.role = 'SUPPLIER'
+        )
+        "#,
+    )
+    .bind(request.supplier_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    if !supplier_exists {
+        return Err(ApiError::bad_request(
+            "Supplier does not exist, is inactive, or lacks the SUPPLIER role",
+        ));
+    }
+
+    let duplicate: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM purchases
+            WHERE supplier_id = $1
+              AND LOWER(BTRIM(supplier_invoice_number)) =
+                  LOWER(BTRIM($2))
+              AND status <> 'CANCELLED'
+        )
+        "#,
+    )
+    .bind(request.supplier_id)
+    .bind(&supplier_invoice_number)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    if duplicate {
+        return Err(ApiError::bad_request(
+            "This supplier invoice number already exists",
+        ));
+    }
+
+    let purchase_number: String = sqlx::query_scalar(
+        r#"
+        SELECT 'PUR-' || TO_CHAR(CURRENT_DATE, 'YYYYMMDD')
+            || '-' || UPPER(SUBSTRING(REPLACE(gen_random_uuid()::TEXT, '-', '') FROM 1 FOR 8))
+        "#,
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let mut subtotal = Decimal::ZERO;
+    let mut total_discount = Decimal::ZERO;
+    let mut taxable_total = Decimal::ZERO;
+    let mut tax_total = Decimal::ZERO;
+    let mut grand_total = Decimal::ZERO;
+
+    let purchase_id: Uuid = sqlx::query_scalar(
+        r#"
+        INSERT INTO purchases (
+            purchase_number,
+            supplier_id,
+            supplier_invoice_number,
+            invoice_date,
+            due_date,
+            status,
+            notes
+        )
+        VALUES ($1, $2, $3, $4, $5, 'DRAFT', $6)
+        RETURNING id
+        "#,
+    )
+    .bind(&purchase_number)
+    .bind(request.supplier_id)
+    .bind(&supplier_invoice_number)
+    .bind(request.invoice_date)
+    .bind(request.due_date)
+    .bind(request.notes.as_deref())
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    for (index, item) in request.items.iter().enumerate() {
+        let product_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM products WHERE id = $1 AND is_active = TRUE)",
+        )
+        .bind(item.product_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(ApiError::internal)?;
+
+        if !product_exists {
+            return Err(ApiError::bad_request(format!(
+                "Product {} does not exist or is inactive",
+                item.product_id
+            )));
+        }
+
+        let free_quantity = item.free_quantity.unwrap_or(Decimal::ZERO);
+        let discount_percent = item.discount_percent.unwrap_or(Decimal::ZERO);
+
+        let line_subtotal = item.quantity * item.purchase_rate;
+        let discount_amount =
+            (line_subtotal * discount_percent / Decimal::ONE_HUNDRED).round_dp(2);
+        let taxable_amount = (line_subtotal - discount_amount).round_dp(2);
+
+        // Draft creation currently uses GST-exclusive calculation.
+        // Tax-inclusive support is added through an explicit tax_mode
+        // field before posting is implemented.
+        let tax_amount =
+            (taxable_amount * item.gst_rate / Decimal::ONE_HUNDRED).round_dp(2);
+
+        let total_amount = taxable_amount + tax_amount;
+
+        // Purchase rate and amount are stored with decimal precision.
+        subtotal += line_subtotal;
+        total_discount += discount_amount;
+        taxable_total += taxable_amount;
+        tax_total += tax_amount;
+        grand_total += total_amount;
+
+        let cgst = (tax_amount / Decimal::TWO).round_dp(2);
+        let sgst = tax_amount - cgst;
+
+        sqlx::query(
+            r#"
+            INSERT INTO purchase_items (
+                purchase_id,
+                line_number,
+                product_id,
+                batch_number,
+                manufacturing_date,
+                expiry_date,
+                quantity,
+                free_quantity,
+                purchase_rate,
+                mrp,
+                selling_rate,
+                discount_percent,
+                discount_amount,
+                gst_rate,
+                taxable_amount,
+                cgst_amount,
+                sgst_amount,
+                igst_amount,
+                total_amount
+            )
+            VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                $11, $12, $13, $14, $15, $16, $17, 0, $18
+            )
+            "#,
+        )
+        .bind(purchase_id)
+        .bind((index + 1) as i32)
+        .bind(item.product_id)
+        .bind(item.batch_number.trim())
+        .bind(item.manufacturing_date)
+        .bind(item.expiry_date)
+        .bind(item.quantity)
+        .bind(free_quantity)
+        .bind(item.purchase_rate)
+        .bind(item.mrp)
+        .bind(item.selling_rate.unwrap_or(Decimal::ZERO))
+        .bind(discount_percent)
+        .bind(discount_amount)
+        .bind(item.gst_rate)
+        .bind(taxable_amount)
+        .bind(cgst)
+        .bind(sgst)
+        .bind(total_amount)
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::internal)?;
+    }
+
+    sqlx::query(
+        r#"
+        UPDATE purchases
+        SET subtotal = $2,
+            discount_amount = $3,
+            taxable_amount = $4,
+            tax_amount = $5,
+            grand_total = $6,
+            updated_at = NOW()
+        WHERE id = $1
+        "#,
+    )
+    .bind(purchase_id)
+    .bind(subtotal.round_dp(2))
+    .bind(total_discount.round_dp(2))
+    .bind(taxable_total.round_dp(2))
+    .bind(tax_total.round_dp(2))
+    .bind(grand_total.round_dp(2))
+    .execute(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    tx.commit().await.map_err(ApiError::internal)?;
+
+    let purchase = sqlx::query_as::<_, PurchaseDetail>(
+        r#"
+        SELECT
+            p.id,
+            p.purchase_number,
+            p.supplier_id,
+            s.name AS supplier_name,
+            p.supplier_invoice_number,
+            p.invoice_date,
+            p.due_date,
+            p.status,
+            p.subtotal,
+            p.discount_amount,
+            p.taxable_amount,
+            p.tax_amount,
+            p.other_charges,
+            p.round_off,
+            p.grand_total,
+            p.paid_amount,
+            p.notes,
+            p.created_at
+        FROM purchases p
+        JOIN parties s ON s.id = p.supplier_id
+        WHERE p.id = $1
+        "#,
+    )
+    .bind(purchase_id)
+    .fetch_one(&pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let items = sqlx::query_as::<_, PurchaseItemDetail>(
+        r#"
+        SELECT
+            pi.id,
+            pi.line_number,
+            pi.product_id,
+            p.name AS product_name,
+            p.sku,
+            pi.batch_id,
+            pi.batch_number,
+            pi.manufacturing_date,
+            pi.expiry_date,
+            pi.quantity,
+            pi.free_quantity,
+            pi.purchase_rate,
+            pi.mrp,
+            pi.selling_rate,
+            pi.discount_percent,
+            pi.discount_amount,
+            pi.gst_rate,
+            pi.taxable_amount,
+            pi.cgst_amount,
+            pi.sgst_amount,
+            pi.igst_amount,
+            pi.total_amount
+        FROM purchase_items pi
+        JOIN products p ON p.id = pi.product_id
+        WHERE pi.purchase_id = $1
+        ORDER BY pi.line_number
+        "#,
+    )
+    .bind(purchase_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(PurchaseDetailResponse { purchase, items }),
+    ))
+}

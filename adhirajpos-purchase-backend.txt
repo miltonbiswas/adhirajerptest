@@ -1,0 +1,3809 @@
+
+==================================================
+FILE: backend\Cargo.toml
+==================================================
+
+[package]
+name = "backend"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+axum = { version = "0.8.9", features = ["json", "multipart"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+dotenvy = "0.15.7"
+rust_decimal = { version = "1.43.0", features = ["serde"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sqlx = { version = "0.9.0", features = ["runtime-tokio", "postgres", "migrate", "macros", "uuid", "chrono", "rust_decimal"] }
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "net"] }
+tower-http = { version = "0.7.1", features = ["cors", "trace"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = { version = "1.29.0", features = ["v4", "serde"] }
+csv = "1.4"
+
+==================================================
+FILE: backend\src\db\mod.rs
+==================================================
+
+pub mod pool;
+
+
+==================================================
+FILE: backend\src\db\pool.rs
+==================================================
+
+use anyhow::{Context, Result};
+use sqlx::postgres::PgPoolOptions;
+use sqlx::{PgPool, postgres::PgConnectOptions};
+use std::time::Duration;
+
+use crate::config::Config;
+
+pub async fn create_pool(config: &Config) -> Result<PgPool> {
+    let options = PgConnectOptions::new()
+        .host(&config.db_host)
+        .port(config.db_port)
+        .database(&config.db_name)
+        .username(&config.db_user)
+        .password(&config.db_password);
+
+    let pool = PgPoolOptions::new()
+        .max_connections(10)
+        .min_connections(1)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect_with(options)
+        .await
+        .context("Failed to connect to PostgreSQL")?;
+
+    sqlx::query("SELECT 1")
+        .execute(&pool)
+        .await
+        .context("PostgreSQL connection test failed")?;
+
+    // Apply pending database migrations.
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .context("Failed to apply database migrations")?;
+
+    tracing::info!("Database connected and migrations applied successfully.");
+
+    Ok(pool)
+}
+
+
+==================================================
+FILE: backend\src\main.rs
+==================================================
+
+mod config;
+mod db;
+mod routes;
+
+use anyhow::Result;
+use axum::{
+    Router,
+    routing::{get, put},
+};
+use config::Config;
+use db::pool::create_pool;
+
+use routes::brands::{create_brand, delete_brand, list_brands, update_brand};
+use routes::business_profile::{get_business_profile, save_business_profile};
+use routes::compositions::{
+    create_composition, delete_composition, list_compositions, update_composition,
+};
+use routes::health::health_check;
+use routes::inventory;
+use routes::manufacturers::list_manufacturers;
+use routes::parties;
+use routes::products::{
+    create_product, delete_product, get_product, list_products, update_product,
+};
+
+use std::net::SocketAddr;
+use tokio::net::TcpListener;
+use tower_http::{
+    cors::{Any, CorsLayer},
+    trace::TraceLayer,
+};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // --------------------------------------------------
+    // INITIALIZE LOGGING
+    // --------------------------------------------------
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    // --------------------------------------------------
+    // LOAD CONFIGURATION
+    // --------------------------------------------------
+    let config = Config::from_env()?;
+
+    // --------------------------------------------------
+    // INITIALIZE DATABASE AND APPLY MIGRATIONS
+    // --------------------------------------------------
+    let pool = create_pool(&config).await?;
+
+    // --------------------------------------------------
+    // CONFIGURE CORS
+    // --------------------------------------------------
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
+    // --------------------------------------------------
+    // REGISTER API ROUTES
+    // --------------------------------------------------
+    let app = Router::new()
+        // HEALTH
+        .route("/api/health", get(health_check))
+        // BUSINESS PROFILE
+        .route(
+            "/api/business-profile",
+            get(get_business_profile).put(save_business_profile),
+        )
+        // PRODUCTS
+        .route("/api/products", get(list_products).post(create_product))
+        .route(
+            "/api/products/{id}",
+            get(get_product).put(update_product).delete(delete_product),
+        )
+        // BRANDS
+        .route("/api/brands", get(list_brands).post(create_brand))
+        .route("/api/brands/{id}", put(update_brand).delete(delete_brand))
+        // MANUFACTURERS
+        .route("/api/manufacturers", get(list_manufacturers))
+        // COMPOSITIONS
+        .route(
+            "/api/compositions",
+            get(list_compositions).post(create_composition),
+        )
+        .route(
+            "/api/compositions/{id}",
+            put(update_composition).delete(delete_composition),
+        )
+        // PARTIES: SUPPLIERS AND CUSTOMERS
+        .nest("/api/parties", parties::router())
+        // HSN MASTER
+        .nest("/api/hsn", routes::hsn::router())
+        // INVENTORY
+        .nest("/api/inventory", inventory::router())
+        // APPLICATION STATE
+        .with_state(pool)
+        // MIDDLEWARE
+        .layer(cors)
+        .layer(TraceLayer::new_for_http());
+
+    // --------------------------------------------------
+    // CONFIGURE SERVER ADDRESS
+    // --------------------------------------------------
+    let address = SocketAddr::new(config.server_host.parse()?, config.server_port);
+
+    // --------------------------------------------------
+    // BIND TCP LISTENER
+    // --------------------------------------------------
+    let listener = TcpListener::bind(address).await?;
+
+    // --------------------------------------------------
+    // STARTUP INFORMATION
+    // --------------------------------------------------
+    println!();
+    println!("==============================================");
+    println!("             AdhirajPOS API Server");
+    println!("==============================================");
+    println!("Server:              http://{address}");
+    println!("Health:              http://{address}/api/health");
+    println!();
+
+    println!("--- Business Profile ---");
+    println!("Business Profile:    http://{address}/api/business-profile");
+    println!();
+
+    println!("--- Products ---");
+    println!("Products:            http://{address}/api/products");
+    println!("Product details:     http://{address}/api/products/{{id}}");
+    println!();
+
+    println!("--- Brands ---");
+    println!("Brands:              http://{address}/api/brands");
+    println!("Brand details:       http://{address}/api/brands/{{id}}");
+    println!();
+
+    println!("--- Manufacturers ---");
+    println!("Manufacturers:       http://{address}/api/manufacturers");
+    println!();
+
+    println!("--- Compositions ---");
+    println!("Compositions:        http://{address}/api/compositions");
+    println!("Composition details: http://{address}/api/compositions/{{id}}");
+    println!();
+
+    println!("--- Parties ---");
+    println!("Parties:             http://{address}/api/parties");
+    println!("Party details:       http://{address}/api/parties/{{id}}");
+    println!();
+
+    println!("--- HSN Master ---");
+    println!("HSN list/search:      http://{address}/api/hsn");
+    println!("HSN details:          http://{address}/api/hsn/{{code}}");
+    println!("HSN status:           http://{address}/api/hsn/{{code}}/status");
+    println!();
+
+    println!("--- Inventory ---");
+    println!("Inventory summary:   http://{address}/api/inventory/summary");
+    println!("Inventory batches:   http://{address}/api/inventory/batches");
+    println!("Stock adjustments:   http://{address}/api/inventory/adjustments");
+
+    println!("==============================================");
+    println!();
+
+    // --------------------------------------------------
+    // START HTTP SERVER
+    // --------------------------------------------------
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}
+
+
+==================================================
+FILE: backend\src\routes\brands.rs
+==================================================
+
+use axum::{
+    Json,
+    extract::{Path, Query, State},
+    http::StatusCode,
+};
+use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
+use uuid::Uuid;
+
+#[derive(Debug, Deserialize)]
+pub struct BrandQuery {
+    pub search: Option<String>,
+    pub page: Option<i64>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct Brand {
+    pub id: Uuid,
+    pub name: String,
+    pub manufacturer_id: Option<Uuid>,
+    pub description: Option<String>,
+    pub is_active: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BrandList {
+    pub data: Vec<Brand>,
+    pub page: i64,
+    pub limit: i64,
+    pub total: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BrandInput {
+    pub name: String,
+    pub manufacturer_id: Option<Uuid>,
+    pub description: Option<String>,
+    pub is_active: Option<bool>,
+}
+
+fn validate_name(name: &str) -> Result<String, StatusCode> {
+    let name = name.trim();
+
+    if name.is_empty() || name.len() > 500 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    Ok(name.to_string())
+}
+
+fn database_status(error: &sqlx::Error) -> StatusCode {
+    if let sqlx::Error::Database(db_error) = error {
+        match db_error.code().as_deref() {
+            Some("23505") => return StatusCode::CONFLICT,
+            Some("23503") => return StatusCode::CONFLICT,
+            Some("23514") => return StatusCode::BAD_REQUEST,
+            _ => {}
+        }
+    }
+
+    tracing::error!("Brand database operation failed: {error}");
+    StatusCode::INTERNAL_SERVER_ERROR
+}
+
+pub async fn list_brands(
+    State(pool): State<PgPool>,
+    Query(query): Query<BrandQuery>,
+) -> Result<Json<BrandList>, StatusCode> {
+    let page = query.page.unwrap_or(1).max(1);
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    let offset = (page - 1) * limit;
+
+    let search = query.search.unwrap_or_default().trim().to_string();
+    let pattern = format!("%{}%", search);
+
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM brands WHERE name ILIKE $1")
+        .bind(&pattern)
+        .fetch_one(&pool)
+        .await
+        .map_err(|error| database_status(&error))?;
+
+    let data = sqlx::query_as::<_, Brand>(
+        r#"
+        SELECT id, name, manufacturer_id, description, is_active
+        FROM brands
+        WHERE name ILIKE $1
+        ORDER BY name ASC
+        LIMIT $2 OFFSET $3
+        "#,
+    )
+    .bind(&pattern)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&pool)
+    .await
+    .map_err(|error| database_status(&error))?;
+
+    Ok(Json(BrandList {
+        data,
+        page,
+        limit,
+        total,
+    }))
+}
+
+pub async fn create_brand(
+    State(pool): State<PgPool>,
+    Json(input): Json<BrandInput>,
+) -> Result<(StatusCode, Json<Brand>), StatusCode> {
+    let name = validate_name(&input.name)?;
+
+    let brand = sqlx::query_as::<_, Brand>(
+        r#"
+        INSERT INTO brands (
+            name,
+            manufacturer_id,
+            description,
+            is_active
+        )
+        VALUES ($1, $2, $3, $4)
+        RETURNING id, name, manufacturer_id, description, is_active
+        "#,
+    )
+    .bind(name)
+    .bind(input.manufacturer_id)
+    .bind(input.description)
+    .bind(input.is_active.unwrap_or(true))
+    .fetch_one(&pool)
+    .await
+    .map_err(|error| database_status(&error))?;
+
+    Ok((StatusCode::CREATED, Json(brand)))
+}
+
+pub async fn update_brand(
+    State(pool): State<PgPool>,
+    Path(id): Path<Uuid>,
+    Json(input): Json<BrandInput>,
+) -> Result<Json<Brand>, StatusCode> {
+    let name = validate_name(&input.name)?;
+
+    let brand = sqlx::query_as::<_, Brand>(
+        r#"
+        UPDATE brands
+        SET
+            name = $2,
+            manufacturer_id = $3,
+            description = $4,
+            is_active = $5,
+            updated_at = NOW()
+        WHERE id = $1
+        RETURNING id, name, manufacturer_id, description, is_active
+        "#,
+    )
+    .bind(id)
+    .bind(name)
+    .bind(input.manufacturer_id)
+    .bind(input.description)
+    .bind(input.is_active.unwrap_or(true))
+    .fetch_optional(&pool)
+    .await
+    .map_err(|error| database_status(&error))?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    Ok(Json(brand))
+}
+
+pub async fn delete_brand(
+    State(pool): State<PgPool>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, StatusCode> {
+    // Soft delete: preserve the brand and its product references.
+    let result = sqlx::query(
+        r#"
+        UPDATE brands
+        SET is_active = FALSE, updated_at = NOW()
+        WHERE id = $1 AND is_active = TRUE
+        "#,
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .map_err(|error| database_status(&error))?;
+
+    if result.rows_affected() == 0 {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+
+==================================================
+FILE: backend\src\routes\business_profile.rs
+==================================================
+
+use axum::{Json, http::StatusCode, response::IntoResponse};
+use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct BusinessProfile {
+    pub business_name: String,
+    pub legal_name: String,
+    pub business_type: String,
+    pub owner_name: String,
+
+    pub phone: String,
+    pub email: String,
+
+    pub address_line1: String,
+    pub address_line2: String,
+    pub city: String,
+    pub district: String,
+    pub state: String,
+    pub pincode: String,
+    pub country: String,
+
+    pub gstin: String,
+    pub drug_license_retail: String,
+    pub drug_license_wholesale: String,
+    pub pharmacy_registration: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BusinessProfileInput {
+    #[serde(default)]
+    pub business_name: String,
+    #[serde(default)]
+    pub legal_name: String,
+    #[serde(default)]
+    pub business_type: String,
+    #[serde(default)]
+    pub owner_name: String,
+
+    #[serde(default)]
+    pub phone: String,
+    #[serde(default)]
+    pub email: String,
+
+    #[serde(default)]
+    pub address_line1: String,
+    #[serde(default)]
+    pub address_line2: String,
+    #[serde(default)]
+    pub city: String,
+    #[serde(default)]
+    pub district: String,
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub pincode: String,
+    #[serde(default)]
+    pub country: String,
+
+    #[serde(default)]
+    pub gstin: String,
+    #[serde(default)]
+    pub drug_license_retail: String,
+    #[serde(default)]
+    pub drug_license_wholesale: String,
+    #[serde(default)]
+    pub pharmacy_registration: String,
+}
+
+fn normalize(value: &str) -> String {
+    value.trim().to_string()
+}
+
+fn error_response(status: StatusCode, message: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        status,
+        Json(serde_json::json!({
+            "error": message
+        })),
+    )
+}
+
+async fn fetch_profile(pool: &PgPool) -> Result<Option<BusinessProfile>, sqlx::Error> {
+    sqlx::query_as::<_, BusinessProfile>(
+        r#"
+        SELECT
+            business_name,
+            legal_name,
+            business_type,
+            owner_name,
+            phone,
+            email,
+            address_line1,
+            address_line2,
+            city,
+            district,
+            state,
+            pincode,
+            country,
+            gstin,
+            drug_license_retail,
+            drug_license_wholesale,
+            pharmacy_registration
+        FROM business_profile
+        WHERE id = 1
+        "#,
+    )
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn get_business_profile(
+    axum::extract::State(pool): axum::extract::State<PgPool>,
+) -> impl IntoResponse {
+    match fetch_profile(&pool).await {
+        Ok(Some(profile)) => (StatusCode::OK, Json(serde_json::json!(profile))).into_response(),
+
+        Ok(None) => {
+            let empty = BusinessProfile {
+                business_name: String::new(),
+                legal_name: String::new(),
+                business_type: "Pharmacy / Medical Store".to_string(),
+                owner_name: String::new(),
+                phone: String::new(),
+                email: String::new(),
+                address_line1: String::new(),
+                address_line2: String::new(),
+                city: String::new(),
+                district: String::new(),
+                state: "Rajasthan".to_string(),
+                pincode: String::new(),
+                country: "India".to_string(),
+                gstin: String::new(),
+                drug_license_retail: String::new(),
+                drug_license_wholesale: String::new(),
+                pharmacy_registration: String::new(),
+            };
+
+            (StatusCode::OK, Json(serde_json::json!(empty))).into_response()
+        }
+
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                "Failed to fetch business profile"
+            );
+
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Business profile fetch failed",
+            )
+            .into_response()
+        }
+    }
+}
+
+pub async fn save_business_profile(
+    axum::extract::State(pool): axum::extract::State<PgPool>,
+    Json(input): Json<BusinessProfileInput>,
+) -> impl IntoResponse {
+    let business_name = normalize(&input.business_name);
+
+    if business_name.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "Business name is required")
+            .into_response();
+    }
+
+    if business_name.chars().count() > 200 {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "Business name must not exceed 200 characters",
+        )
+        .into_response();
+    }
+
+    let pincode = normalize(&input.pincode);
+
+    if !pincode.is_empty() && (pincode.len() != 6 || !pincode.chars().all(|c| c.is_ascii_digit())) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "PIN code must contain exactly 6 digits",
+        )
+        .into_response();
+    }
+
+    let gstin = normalize(&input.gstin).to_ascii_uppercase();
+
+    if !gstin.is_empty() && (gstin.len() != 15 || !gstin.chars().all(|c| c.is_ascii_alphanumeric()))
+    {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "GSTIN must contain 15 alphanumeric characters",
+        )
+        .into_response();
+    }
+
+    let legal_name = normalize(&input.legal_name);
+    let business_type = normalize(&input.business_type);
+    let owner_name = normalize(&input.owner_name);
+    let phone = normalize(&input.phone);
+    let email = normalize(&input.email);
+    let address_line1 = normalize(&input.address_line1);
+    let address_line2 = normalize(&input.address_line2);
+    let city = normalize(&input.city);
+    let district = normalize(&input.district);
+    let state = normalize(&input.state);
+    let country = normalize(&input.country);
+    let drug_license_retail = normalize(&input.drug_license_retail);
+    let drug_license_wholesale = normalize(&input.drug_license_wholesale);
+    let pharmacy_registration = normalize(&input.pharmacy_registration);
+
+    let result = sqlx::query(
+        r#"
+        INSERT INTO business_profile (
+            id,
+            business_name,
+            legal_name,
+            business_type,
+            owner_name,
+            phone,
+            email,
+            address_line1,
+            address_line2,
+            city,
+            district,
+            state,
+            pincode,
+            country,
+            gstin,
+            drug_license_retail,
+            drug_license_wholesale,
+            pharmacy_registration
+        )
+        VALUES (
+            1, $1, $2, $3, $4, $5, $6, $7, $8, $9,
+            $10, $11, $12, $13, $14, $15, $16, $17
+        )
+        ON CONFLICT (id)
+        DO UPDATE SET
+            business_name = EXCLUDED.business_name,
+            legal_name = EXCLUDED.legal_name,
+            business_type = EXCLUDED.business_type,
+            owner_name = EXCLUDED.owner_name,
+            phone = EXCLUDED.phone,
+            email = EXCLUDED.email,
+            address_line1 = EXCLUDED.address_line1,
+            address_line2 = EXCLUDED.address_line2,
+            city = EXCLUDED.city,
+            district = EXCLUDED.district,
+            state = EXCLUDED.state,
+            pincode = EXCLUDED.pincode,
+            country = EXCLUDED.country,
+            gstin = EXCLUDED.gstin,
+            drug_license_retail = EXCLUDED.drug_license_retail,
+            drug_license_wholesale = EXCLUDED.drug_license_wholesale,
+            pharmacy_registration = EXCLUDED.pharmacy_registration,
+            updated_at = NOW()
+        "#,
+    )
+    .bind(&business_name)
+    .bind(&legal_name)
+    .bind(&business_type)
+    .bind(&owner_name)
+    .bind(&phone)
+    .bind(&email)
+    .bind(&address_line1)
+    .bind(&address_line2)
+    .bind(&city)
+    .bind(&district)
+    .bind(&state)
+    .bind(&pincode)
+    .bind(&country)
+    .bind(&gstin)
+    .bind(&drug_license_retail)
+    .bind(&drug_license_wholesale)
+    .bind(&pharmacy_registration)
+    .execute(&pool)
+    .await;
+
+    match result {
+        Ok(_) => match fetch_profile(&pool).await {
+            Ok(Some(profile)) => (StatusCode::OK, Json(serde_json::json!(profile))).into_response(),
+
+            Ok(None) => error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Profile saved but could not be retrieved",
+            )
+            .into_response(),
+
+            Err(error) => {
+                tracing::error!(
+                    error = %error,
+                    "Profile saved but fetch failed"
+                );
+
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Profile saved but could not be retrieved",
+                )
+                .into_response()
+            }
+        },
+
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                "Failed to save business profile"
+            );
+
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Business profile save failed",
+            )
+            .into_response()
+        }
+    }
+}
+
+
+==================================================
+FILE: backend\src\routes\compositions.rs
+==================================================
+
+use axum::{
+    Json,
+    extract::{Path, Query, State},
+    http::StatusCode,
+};
+use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
+use uuid::Uuid;
+
+#[derive(Debug, Deserialize)]
+pub struct CompositionQuery {
+    pub search: Option<String>,
+    pub page: Option<i64>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct Composition {
+    pub id: Uuid,
+    pub name: String,
+    pub description: Option<String>,
+    pub is_active: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CompositionList {
+    pub data: Vec<Composition>,
+    pub page: i64,
+    pub limit: i64,
+    pub total: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CompositionInput {
+    pub name: String,
+    pub description: Option<String>,
+    pub is_active: Option<bool>,
+}
+
+fn validate_name(name: &str) -> Result<String, StatusCode> {
+    let name = name.trim();
+
+    if name.is_empty() || name.len() > 500 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    Ok(name.to_string())
+}
+
+fn database_status(error: &sqlx::Error) -> StatusCode {
+    if let sqlx::Error::Database(db_error) = error {
+        match db_error.code().as_deref() {
+            Some("23505") => return StatusCode::CONFLICT,
+            Some("23503") => return StatusCode::CONFLICT,
+            Some("23514") => return StatusCode::BAD_REQUEST,
+            _ => {}
+        }
+    }
+
+    tracing::error!("Composition database operation failed: {error}");
+    StatusCode::INTERNAL_SERVER_ERROR
+}
+
+pub async fn list_compositions(
+    State(pool): State<PgPool>,
+    Query(query): Query<CompositionQuery>,
+) -> Result<Json<CompositionList>, StatusCode> {
+    let page = query.page.unwrap_or(1).max(1);
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    let offset = (page - 1) * limit;
+
+    let search = query.search.unwrap_or_default().trim().to_string();
+    let pattern = format!("%{}%", search);
+
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM compositions WHERE name ILIKE $1")
+        .bind(&pattern)
+        .fetch_one(&pool)
+        .await
+        .map_err(|error| database_status(&error))?;
+
+    let data = sqlx::query_as::<_, Composition>(
+        r#"
+        SELECT id, name, description, is_active
+        FROM compositions
+        WHERE name ILIKE $1
+        ORDER BY name ASC
+        LIMIT $2 OFFSET $3
+        "#,
+    )
+    .bind(&pattern)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&pool)
+    .await
+    .map_err(|error| database_status(&error))?;
+
+    Ok(Json(CompositionList {
+        data,
+        page,
+        limit,
+        total,
+    }))
+}
+
+pub async fn create_composition(
+    State(pool): State<PgPool>,
+    Json(input): Json<CompositionInput>,
+) -> Result<(StatusCode, Json<Composition>), StatusCode> {
+    let name = validate_name(&input.name)?;
+
+    let composition = sqlx::query_as::<_, Composition>(
+        r#"
+        INSERT INTO compositions (name, description, is_active)
+        VALUES ($1, $2, $3)
+        RETURNING id, name, description, is_active
+        "#,
+    )
+    .bind(name)
+    .bind(input.description)
+    .bind(input.is_active.unwrap_or(true))
+    .fetch_one(&pool)
+    .await
+    .map_err(|error| database_status(&error))?;
+
+    Ok((StatusCode::CREATED, Json(composition)))
+}
+
+pub async fn update_composition(
+    State(pool): State<PgPool>,
+    Path(id): Path<Uuid>,
+    Json(input): Json<CompositionInput>,
+) -> Result<Json<Composition>, StatusCode> {
+    let name = validate_name(&input.name)?;
+
+    let composition = sqlx::query_as::<_, Composition>(
+        r#"
+        UPDATE compositions
+        SET
+            name = $2,
+            description = $3,
+            is_active = $4,
+            updated_at = NOW()
+        WHERE id = $1
+        RETURNING id, name, description, is_active
+        "#,
+    )
+    .bind(id)
+    .bind(name)
+    .bind(input.description)
+    .bind(input.is_active.unwrap_or(true))
+    .fetch_optional(&pool)
+    .await
+    .map_err(|error| database_status(&error))?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    Ok(Json(composition))
+}
+
+pub async fn delete_composition(
+    State(pool): State<PgPool>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, StatusCode> {
+    // Soft delete: retain composition history and product mappings.
+    let result = sqlx::query(
+        r#"
+        UPDATE compositions
+        SET is_active = FALSE, updated_at = NOW()
+        WHERE id = $1 AND is_active = TRUE
+        "#,
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .map_err(|error| database_status(&error))?;
+
+    if result.rows_affected() == 0 {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+
+==================================================
+FILE: backend\src\routes\health.rs
+==================================================
+
+use axum::{Json, extract::State, http::StatusCode};
+use serde::Serialize;
+use sqlx::PgPool;
+
+#[derive(Serialize)]
+pub struct HealthResponse {
+    pub status: &'static str,
+    pub database: &'static str,
+}
+
+pub async fn health_check(
+    State(pool): State<PgPool>,
+) -> Result<Json<HealthResponse>, (StatusCode, Json<HealthResponse>)> {
+    match sqlx::query("SELECT 1").execute(&pool).await {
+        Ok(_) => Ok(Json(HealthResponse {
+            status: "ok",
+            database: "connected",
+        })),
+        Err(_) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(HealthResponse {
+                status: "error",
+                database: "unavailable",
+            }),
+        )),
+    }
+}
+
+
+==================================================
+FILE: backend\src\routes\hsn.rs
+==================================================
+
+use axum::{
+    Json, Router,
+    extract::{Multipart, Path, Query, State},
+    http::StatusCode,
+    routing::{get, patch, post},
+};
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
+
+// ============================================================
+// MODELS
+// ============================================================
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct Hsn {
+    pub hsn_code: String,
+    pub description: String,
+    pub gst_rate: Decimal,
+    pub cgst_rate: Decimal,
+    pub sgst_rate: Decimal,
+    pub igst_rate: Decimal,
+    pub is_active: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HsnList {
+    pub data: Vec<Hsn>,
+    pub page: i64,
+    pub limit: i64,
+    pub total: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HsnQuery {
+    pub search: Option<String>,
+    pub page: Option<i64>,
+    pub limit: Option<i64>,
+    pub active: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HsnInput {
+    pub hsn_code: String,
+    pub description: Option<String>,
+    pub gst_rate: Decimal,
+    pub cgst_rate: Decimal,
+    pub sgst_rate: Decimal,
+    pub igst_rate: Decimal,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HsnStatusInput {
+    pub is_active: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ApiError {
+    pub error: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct HsnCsvRow {
+    hsn_code: String,
+    gst_rate: Decimal,
+    cgst_rate: Decimal,
+    sgst_rate: Decimal,
+    igst_rate: Decimal,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HsnImportError {
+    pub row: usize,
+    pub hsn_code: String,
+    pub error: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HsnImportResult {
+    pub total_rows: usize,
+    pub inserted: usize,
+    pub skipped: usize,
+    pub rejected: usize,
+    pub errors: Vec<HsnImportError>,
+}
+
+// ============================================================
+// ROUTER
+// ============================================================
+
+pub fn router() -> Router<PgPool> {
+    Router::new()
+        .route("/", get(list_hsn).post(create_hsn))
+        .route("/import", post(import_hsn_csv))
+        .route("/{code}", get(get_hsn).put(update_hsn))
+        .route("/{code}/status", patch(update_hsn_status))
+}
+
+// ============================================================
+// LIST HSN
+// GET /api/hsn
+// GET /api/hsn?search=3004&page=1&limit=50
+// ============================================================
+
+pub async fn list_hsn(
+    State(pool): State<PgPool>,
+    Query(query): Query<HsnQuery>,
+) -> Result<Json<HsnList>, (StatusCode, Json<ApiError>)> {
+    let page = query.page.unwrap_or(1).max(1);
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    let offset = (page - 1) * limit;
+    let search = query.search.unwrap_or_default().trim().to_owned();
+    let active = query.active;
+
+    let total: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM public.hsn_master
+        WHERE
+            ($1 = '' OR hsn_code ILIKE '%' || $1 || '%'
+             OR description ILIKE '%' || $1 || '%')
+            AND ($2::BOOLEAN IS NULL OR is_active = $2)
+        "#,
+    )
+    .bind(&search)
+    .bind(active)
+    .fetch_one(&pool)
+    .await
+    .map_err(internal_error)?;
+
+    let data = sqlx::query_as::<_, Hsn>(
+        r#"
+        SELECT
+            hsn_code,
+            description,
+            gst_rate,
+            cgst_rate,
+            sgst_rate,
+            igst_rate,
+            is_active,
+            created_at,
+            updated_at
+        FROM public.hsn_master
+        WHERE
+            ($1 = '' OR hsn_code ILIKE '%' || $1 || '%'
+             OR description ILIKE '%' || $1 || '%')
+            AND ($2::BOOLEAN IS NULL OR is_active = $2)
+        ORDER BY hsn_code
+        LIMIT $3 OFFSET $4
+        "#,
+    )
+    .bind(&search)
+    .bind(active)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&pool)
+    .await
+    .map_err(internal_error)?;
+
+    Ok(Json(HsnList {
+        data,
+        page,
+        limit,
+        total,
+    }))
+}
+
+// ============================================================
+// GET SINGLE HSN
+// GET /api/hsn/{code}
+// ============================================================
+
+pub async fn get_hsn(
+    State(pool): State<PgPool>,
+    Path(code): Path<String>,
+) -> Result<Json<Hsn>, (StatusCode, Json<ApiError>)> {
+    let code = code.trim();
+
+    let hsn = sqlx::query_as::<_, Hsn>(
+        r#"
+        SELECT
+            hsn_code,
+            description,
+            gst_rate,
+            cgst_rate,
+            sgst_rate,
+            igst_rate,
+            is_active,
+            created_at,
+            updated_at
+        FROM public.hsn_master
+        WHERE hsn_code = $1
+        "#,
+    )
+    .bind(code)
+    .fetch_optional(&pool)
+    .await
+    .map_err(internal_error)?
+    .ok_or_else(not_found)?;
+
+    Ok(Json(hsn))
+}
+
+// ============================================================
+// CREATE HSN
+// POST /api/hsn
+// ============================================================
+
+pub async fn create_hsn(
+    State(pool): State<PgPool>,
+    Json(input): Json<HsnInput>,
+) -> Result<(StatusCode, Json<Hsn>), (StatusCode, Json<ApiError>)> {
+    let code = input.hsn_code.trim();
+    validate_hsn(code, &input)?;
+
+    let description = input
+        .description
+        .as_ref()
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_default();
+
+    let hsn = sqlx::query_as::<_, Hsn>(
+        r#"
+        INSERT INTO public.hsn_master (
+            hsn_code,
+            description,
+            gst_rate,
+            cgst_rate,
+            sgst_rate,
+            igst_rate
+        )
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING
+            hsn_code,
+            description,
+            gst_rate,
+            cgst_rate,
+            sgst_rate,
+            igst_rate,
+            is_active,
+            created_at,
+            updated_at
+        "#,
+    )
+    .bind(code)
+    .bind(description)
+    .bind(input.gst_rate)
+    .bind(input.cgst_rate)
+    .bind(input.sgst_rate)
+    .bind(input.igst_rate)
+    .fetch_one(&pool)
+    .await
+    .map_err(write_error)?;
+
+    Ok((StatusCode::CREATED, Json(hsn)))
+}
+
+// ============================================================
+// UPDATE HSN
+// PUT /api/hsn/{code}
+// ============================================================
+
+pub async fn update_hsn(
+    State(pool): State<PgPool>,
+    Path(code): Path<String>,
+    Json(input): Json<HsnInput>,
+) -> Result<Json<Hsn>, (StatusCode, Json<ApiError>)> {
+    let code = code.trim();
+
+    if input.hsn_code.trim() != code {
+        return Err(bad_request(
+            "The HSN code in the URL and request body must match",
+        ));
+    }
+
+    validate_hsn(code, &input)?;
+
+    let description = input
+        .description
+        .as_ref()
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_default();
+
+    let hsn = sqlx::query_as::<_, Hsn>(
+        r#"
+        UPDATE public.hsn_master
+        SET
+            description = $2,
+            gst_rate = $3,
+            cgst_rate = $4,
+            sgst_rate = $5,
+            igst_rate = $6,
+            updated_at = NOW()
+        WHERE hsn_code = $1
+        RETURNING
+            hsn_code,
+            description,
+            gst_rate,
+            cgst_rate,
+            sgst_rate,
+            igst_rate,
+            is_active,
+            created_at,
+            updated_at
+        "#,
+    )
+    .bind(code)
+    .bind(description)
+    .bind(input.gst_rate)
+    .bind(input.cgst_rate)
+    .bind(input.sgst_rate)
+    .bind(input.igst_rate)
+    .fetch_optional(&pool)
+    .await
+    .map_err(internal_error)?
+    .ok_or_else(not_found)?;
+
+    Ok(Json(hsn))
+}
+
+// ============================================================
+// ACTIVATE / DEACTIVATE HSN
+// PATCH /api/hsn/{code}/status
+// ============================================================
+
+pub async fn update_hsn_status(
+    State(pool): State<PgPool>,
+    Path(code): Path<String>,
+    Json(input): Json<HsnStatusInput>,
+) -> Result<Json<Hsn>, (StatusCode, Json<ApiError>)> {
+    let hsn = sqlx::query_as::<_, Hsn>(
+        r#"
+        UPDATE public.hsn_master
+        SET
+            is_active = $2,
+            updated_at = NOW()
+        WHERE hsn_code = $1
+        RETURNING
+            hsn_code,
+            description,
+            gst_rate,
+            cgst_rate,
+            sgst_rate,
+            igst_rate,
+            is_active,
+            created_at,
+            updated_at
+        "#,
+    )
+    .bind(code.trim())
+    .bind(input.is_active)
+    .fetch_optional(&pool)
+    .await
+    .map_err(internal_error)?
+    .ok_or_else(not_found)?;
+
+    Ok(Json(hsn))
+}
+
+// ============================================================
+// CSV BULK IMPORT
+// POST /api/hsn/import
+//
+// Multipart form field: file
+// Required CSV headers:
+// hsn_code,gst_rate,cgst_rate,sgst_rate,igst_rate
+//
+// Existing records are never overwritten.
+// Invalid rows are reported.
+// Database errors roll back the transaction.
+// ============================================================
+
+pub async fn import_hsn_csv(
+    State(pool): State<PgPool>,
+    mut multipart: Multipart,
+) -> Result<Json<HsnImportResult>, (StatusCode, Json<ApiError>)> {
+    let mut csv_bytes: Option<Vec<u8>> = None;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|_| bad_request("Could not read uploaded file"))?
+    {
+        if field.name() == Some("file") {
+            let bytes = field
+                .bytes()
+                .await
+                .map_err(|_| bad_request("Could not read CSV file"))?;
+
+            if bytes.len() > 5 * 1024 * 1024 {
+                return Err(bad_request("CSV file must be 5 MB or smaller"));
+            }
+
+            csv_bytes = Some(bytes.to_vec());
+            break;
+        }
+    }
+
+    let bytes =
+        csv_bytes.ok_or_else(|| bad_request("Upload a CSV using the multipart field 'file'"))?;
+
+    if bytes.is_empty() {
+        return Err(bad_request("CSV file is empty"));
+    }
+
+    let mut reader = csv::ReaderBuilder::new()
+        .trim(csv::Trim::All)
+        .from_reader(bytes.as_slice());
+
+    let headers = reader
+        .headers()
+        .map_err(|_| bad_request("Could not parse CSV headers"))?
+        .clone();
+
+    let required_headers = [
+        "hsn_code",
+        "gst_rate",
+        "cgst_rate",
+        "sgst_rate",
+        "igst_rate",
+    ];
+
+    for required in required_headers {
+        if !headers.iter().any(|header| header == required) {
+            return Err(bad_request(&format!(
+                "CSV is missing required column: {required}"
+            )));
+        }
+    }
+
+    let mut result = HsnImportResult {
+        total_rows: 0,
+        inserted: 0,
+        skipped: 0,
+        rejected: 0,
+        errors: Vec::new(),
+    };
+
+    let mut tx = pool.begin().await.map_err(internal_error)?;
+
+    for (index, record) in reader.deserialize::<HsnCsvRow>().enumerate() {
+        result.total_rows += 1;
+        let row_number = index + 2;
+
+        let row = match record {
+            Ok(row) => row,
+            Err(error) => {
+                result.rejected += 1;
+                result.errors.push(HsnImportError {
+                    row: row_number,
+                    hsn_code: String::new(),
+                    error: format!("Invalid CSV row: {error}"),
+                });
+                continue;
+            }
+        };
+
+        let code = row.hsn_code.trim();
+
+        if !is_valid_hsn_code(code) {
+            result.rejected += 1;
+            result.errors.push(HsnImportError {
+                row: row_number,
+                hsn_code: code.to_owned(),
+                error: "HSN code must contain 1-8 ASCII letters, digits or dots".to_owned(),
+            });
+            continue;
+        }
+
+        let rates = [row.gst_rate, row.cgst_rate, row.sgst_rate, row.igst_rate];
+
+        if rates
+            .iter()
+            .any(|rate| *rate < Decimal::ZERO || *rate > Decimal::from(100))
+        {
+            result.rejected += 1;
+            result.errors.push(HsnImportError {
+                row: row_number,
+                hsn_code: code.to_owned(),
+                error: "Tax rates must be between 0 and 100".to_owned(),
+            });
+            continue;
+        }
+
+        let insert_result = sqlx::query(
+            r#"
+            INSERT INTO public.hsn_master (
+                hsn_code,
+                description,
+                gst_rate,
+                cgst_rate,
+                sgst_rate,
+                igst_rate
+            )
+            VALUES ($1, '', $2, $3, $4, $5)
+            ON CONFLICT (hsn_code) DO NOTHING
+            "#,
+        )
+        .bind(code)
+        .bind(row.gst_rate)
+        .bind(row.cgst_rate)
+        .bind(row.sgst_rate)
+        .bind(row.igst_rate)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal_error)?;
+
+        if insert_result.rows_affected() == 1 {
+            result.inserted += 1;
+        } else {
+            result.skipped += 1;
+        }
+    }
+
+    tx.commit().await.map_err(internal_error)?;
+
+    Ok(Json(result))
+}
+
+// ============================================================
+// VALIDATION
+// ============================================================
+
+fn is_valid_hsn_code(code: &str) -> bool {
+    !code.is_empty()
+        && code.len() <= 8
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.')
+}
+
+fn validate_hsn(code: &str, input: &HsnInput) -> Result<(), (StatusCode, Json<ApiError>)> {
+    if !is_valid_hsn_code(code) {
+        return Err(bad_request(
+            "HSN code must contain 1-8 ASCII letters, digits or dots",
+        ));
+    }
+
+    let rates = [
+        input.gst_rate,
+        input.cgst_rate,
+        input.sgst_rate,
+        input.igst_rate,
+    ];
+
+    if rates
+        .iter()
+        .any(|rate| *rate < Decimal::ZERO || *rate > Decimal::from(100))
+    {
+        return Err(bad_request("Tax rates must be between 0 and 100"));
+    }
+
+    Ok(())
+}
+
+// ============================================================
+// ERROR HELPERS
+// ============================================================
+
+fn bad_request(message: &str) -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ApiError {
+            error: message.to_owned(),
+        }),
+    )
+}
+
+fn not_found() -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ApiError {
+            error: "HSN code not found".to_owned(),
+        }),
+    )
+}
+
+fn internal_error(error: sqlx::Error) -> (StatusCode, Json<ApiError>) {
+    tracing::error!("HSN database operation failed: {error}");
+
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ApiError {
+            error: "Database operation failed".to_owned(),
+        }),
+    )
+}
+
+fn write_error(error: sqlx::Error) -> (StatusCode, Json<ApiError>) {
+    if let sqlx::Error::Database(ref db_error) = error {
+        if db_error.is_unique_violation() {
+            return (
+                StatusCode::CONFLICT,
+                Json(ApiError {
+                    error: "This HSN code already exists".to_owned(),
+                }),
+            );
+        }
+
+        if db_error.is_check_violation() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: "One or more tax rates are invalid".to_owned(),
+                }),
+            );
+        }
+    }
+
+    tracing::error!("HSN write failed: {error}");
+
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ApiError {
+            error: "HSN operation failed".to_owned(),
+        }),
+    )
+}
+
+
+==================================================
+FILE: backend\src\routes\inventory.rs
+==================================================
+
+use axum::{
+    Json, Router,
+    extract::{Path, Query, State},
+    http::StatusCode,
+    routing::get,
+};
+use chrono::{DateTime, NaiveDate, Utc};
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use sqlx::{FromRow, PgPool};
+use uuid::Uuid;
+
+pub fn router() -> Router<PgPool> {
+    Router::new()
+        .route("/summary", get(get_inventory_summary))
+        .route("/batches", get(list_inventory_batches))
+        .route(
+            "/adjustments",
+            get(list_stock_adjustments).post(create_stock_adjustment),
+        )
+        .route("/adjustments/{id}", get(get_stock_adjustment))
+}
+
+// ============================================================
+// INVENTORY SUMMARY
+// ============================================================
+
+#[derive(Debug, Serialize, FromRow)]
+pub struct InventorySummary {
+    pub total_products: i64,
+    pub total_batches: i64,
+    pub total_units: Decimal,
+    pub low_stock: i64,
+    pub out_of_stock: i64,
+    pub expiring_soon: i64,
+    pub expired: i64,
+    pub stock_value: Decimal,
+}
+
+pub async fn get_inventory_summary(
+    State(pool): State<PgPool>,
+) -> Result<Json<InventorySummary>, ApiError> {
+    let summary = sqlx::query_as::<_, InventorySummary>(
+        r#"
+        WITH product_stock AS (
+            SELECT
+                p.id AS product_id,
+
+                COALESCE(
+                    SUM(b.quantity_on_hand)
+                    FILTER (WHERE b.is_active = TRUE),
+                    0
+                ) AS quantity,
+
+                COALESCE(
+                    SUM(b.reorder_level)
+                    FILTER (WHERE b.is_active = TRUE),
+                    0
+                ) AS reorder_level
+
+            FROM products p
+            LEFT JOIN product_batches b
+                ON b.product_id = p.id
+
+            WHERE p.is_active = TRUE
+            GROUP BY p.id
+        ),
+
+        batch_summary AS (
+            SELECT
+                COUNT(*) FILTER (
+                    WHERE b.is_active = TRUE
+                      AND b.quantity_on_hand > 0
+                      AND b.expiry_date >= CURRENT_DATE
+                      AND b.expiry_date <= CURRENT_DATE + 90
+                )::BIGINT AS expiring_soon,
+
+                COUNT(*) FILTER (
+                    WHERE b.is_active = TRUE
+                      AND b.quantity_on_hand > 0
+                      AND b.expiry_date < CURRENT_DATE
+                )::BIGINT AS expired,
+
+                COUNT(*) FILTER (
+                    WHERE b.is_active = TRUE
+                )::BIGINT AS total_batches,
+
+                COALESCE(
+                    SUM(b.quantity_on_hand)
+                    FILTER (WHERE b.is_active = TRUE),
+                    0
+                ) AS total_units,
+
+                COALESCE(
+                    SUM(b.quantity_on_hand * b.purchase_rate)
+                    FILTER (WHERE b.is_active = TRUE),
+                    0
+                ) AS stock_value
+
+            FROM product_batches b
+            JOIN products p
+                ON p.id = b.product_id
+
+            WHERE p.is_active = TRUE
+        )
+
+        SELECT
+            (SELECT COUNT(*) FROM product_stock)::BIGINT
+                AS total_products,
+
+            bs.total_batches,
+            bs.total_units::NUMERIC AS total_units,
+
+            (
+                SELECT COUNT(*)
+                FROM product_stock
+                WHERE quantity > 0
+                  AND quantity <= reorder_level
+            )::BIGINT AS low_stock,
+
+            (
+                SELECT COUNT(*)
+                FROM product_stock
+                WHERE quantity = 0
+            )::BIGINT AS out_of_stock,
+
+            bs.expiring_soon,
+            bs.expired,
+            bs.stock_value::NUMERIC AS stock_value
+
+        FROM batch_summary bs
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    Ok(Json(summary))
+}
+
+// ============================================================
+// INVENTORY BATCH LIST
+// ============================================================
+
+#[derive(Debug, Deserialize)]
+pub struct BatchQuery {
+    pub search: Option<String>,
+    pub page: Option<i64>,
+    pub limit: Option<i64>,
+    pub stock_status: Option<String>,
+    pub expiry_status: Option<String>,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+pub struct InventoryBatch {
+    pub id: Uuid,
+    pub product_id: Uuid,
+    pub product_name: String,
+    pub sku: String,
+    pub brand_name: Option<String>,
+    pub batch_number: String,
+    pub manufacturing_date: Option<NaiveDate>,
+    pub expiry_date: Option<NaiveDate>,
+    pub quantity: Decimal,
+    pub reorder_level: Decimal,
+    pub unit: String,
+    pub purchase_rate: Decimal,
+    pub mrp: Decimal,
+    pub selling_rate: Decimal,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchListResponse {
+    pub data: Vec<InventoryBatch>,
+    pub page: i64,
+    pub limit: i64,
+    pub total: i64,
+}
+
+pub async fn list_inventory_batches(
+    State(pool): State<PgPool>,
+    Query(params): Query<BatchQuery>,
+) -> Result<Json<BatchListResponse>, ApiError> {
+    let page = params.page.unwrap_or(1).max(1);
+    let limit = params.limit.unwrap_or(25).clamp(1, 100);
+    let offset = (page - 1) * limit;
+
+    let search = params.search.unwrap_or_default().trim().to_owned();
+    let pattern = format!("%{search}%");
+
+    let stock_status = params
+        .stock_status
+        .unwrap_or_else(|| "all".to_owned())
+        .to_lowercase();
+
+    let expiry_status = params
+        .expiry_status
+        .unwrap_or_else(|| "all".to_owned())
+        .to_lowercase();
+
+    let valid_stock_status = ["all", "in_stock", "low_stock", "out_of_stock"];
+    let valid_expiry_status = ["all", "expired", "expiring_30", "expiring_90", "valid"];
+
+    if !valid_stock_status.contains(&stock_status.as_str()) {
+        return Err(ApiError::bad_request("Invalid stock_status filter"));
+    }
+
+    if !valid_expiry_status.contains(&expiry_status.as_str()) {
+        return Err(ApiError::bad_request("Invalid expiry_status filter"));
+    }
+
+    let total: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM product_batches b
+        JOIN products p ON p.id = b.product_id
+
+        WHERE p.is_active = TRUE
+          AND b.is_active = TRUE
+
+          AND (
+              $1 = ''
+              OR p.name ILIKE $2
+              OR p.sku ILIKE $2
+              OR b.batch_number ILIKE $2
+              OR COALESCE(p.brand_name, '') ILIKE $2
+              OR COALESCE(p.generic_name, '') ILIKE $2
+          )
+
+          AND (
+              $3 = 'all'
+              OR ($3 = 'in_stock' AND b.quantity_on_hand > b.reorder_level)
+              OR ($3 = 'low_stock'
+                  AND b.quantity_on_hand > 0
+                  AND b.quantity_on_hand <= b.reorder_level)
+              OR ($3 = 'out_of_stock' AND b.quantity_on_hand = 0)
+          )
+
+          AND (
+              $4 = 'all'
+              OR ($4 = 'expired' AND b.expiry_date < CURRENT_DATE)
+              OR ($4 = 'expiring_30'
+                  AND b.expiry_date >= CURRENT_DATE
+                  AND b.expiry_date <= CURRENT_DATE + 30)
+              OR ($4 = 'expiring_90'
+                  AND b.expiry_date >= CURRENT_DATE
+                  AND b.expiry_date <= CURRENT_DATE + 90)
+              OR ($4 = 'valid'
+                  AND (b.expiry_date IS NULL OR b.expiry_date > CURRENT_DATE + 90))
+          )
+        "#,
+    )
+    .bind(&search)
+    .bind(&pattern)
+    .bind(&stock_status)
+    .bind(&expiry_status)
+    .fetch_one(&pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let data = sqlx::query_as::<_, InventoryBatch>(
+        r#"
+        SELECT
+            b.id,
+            p.id AS product_id,
+            p.name AS product_name,
+            p.sku,
+            p.brand_name,
+            b.batch_number,
+            b.manufacturing_date,
+            b.expiry_date,
+            b.quantity_on_hand AS quantity,
+            b.reorder_level,
+            p.unit,
+            b.purchase_rate,
+            b.mrp,
+            b.selling_rate
+
+        FROM product_batches b
+        JOIN products p
+            ON p.id = b.product_id
+
+        WHERE p.is_active = TRUE
+          AND b.is_active = TRUE
+
+          AND (
+              $1 = ''
+              OR p.name ILIKE $2
+              OR p.sku ILIKE $2
+              OR b.batch_number ILIKE $2
+              OR COALESCE(p.brand_name, '') ILIKE $2
+              OR COALESCE(p.generic_name, '') ILIKE $2
+          )
+
+          AND (
+              $3 = 'all'
+              OR ($3 = 'in_stock' AND b.quantity_on_hand > b.reorder_level)
+              OR ($3 = 'low_stock'
+                  AND b.quantity_on_hand > 0
+                  AND b.quantity_on_hand <= b.reorder_level)
+              OR ($3 = 'out_of_stock' AND b.quantity_on_hand = 0)
+          )
+
+          AND (
+              $4 = 'all'
+              OR ($4 = 'expired' AND b.expiry_date < CURRENT_DATE)
+              OR ($4 = 'expiring_30'
+                  AND b.expiry_date >= CURRENT_DATE
+                  AND b.expiry_date <= CURRENT_DATE + 30)
+              OR ($4 = 'expiring_90'
+                  AND b.expiry_date >= CURRENT_DATE
+                  AND b.expiry_date <= CURRENT_DATE + 90)
+              OR ($4 = 'valid'
+                  AND (b.expiry_date IS NULL OR b.expiry_date > CURRENT_DATE + 90))
+          )
+
+        ORDER BY
+            b.expiry_date ASC NULLS LAST,
+            p.name ASC,
+            b.batch_number ASC
+
+        LIMIT $5 OFFSET $6
+        "#,
+    )
+    .bind(&search)
+    .bind(&pattern)
+    .bind(&stock_status)
+    .bind(&expiry_status)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    Ok(Json(BatchListResponse {
+        data,
+        page,
+        limit,
+        total,
+    }))
+}
+
+// ============================================================
+// STOCK ADJUSTMENTS
+// ============================================================
+
+#[derive(Debug, Deserialize)]
+pub struct StockAdjustmentInput {
+    pub product_id: Uuid,
+    pub batch_id: Uuid,
+
+    // IN, OUT, ADJUSTMENT
+    pub movement_type: String,
+
+    // IN / OUT: quantity to add or remove.
+    // ADJUSTMENT: target quantity to set.
+    pub quantity: Decimal,
+
+    pub reason: String,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+pub struct StockMovement {
+    pub id: Uuid,
+    pub product_id: Uuid,
+    pub batch_id: Uuid,
+    pub movement_type: String,
+    pub quantity_change: Decimal,
+    pub quantity_before: Decimal,
+    pub quantity_after: Decimal,
+    pub reason: String,
+    pub created_at: DateTime<Utc>,
+}
+
+pub async fn create_stock_adjustment(
+    State(pool): State<PgPool>,
+    Json(input): Json<StockAdjustmentInput>,
+) -> Result<(StatusCode, Json<StockMovement>), ApiError> {
+    let movement_type = input.movement_type.trim().to_uppercase();
+    let reason = input.reason.trim().to_owned();
+
+    if !["IN", "OUT", "ADJUSTMENT"].contains(&movement_type.as_str()) {
+        return Err(ApiError::bad_request(
+            "movement_type must be IN, OUT or ADJUSTMENT",
+        ));
+    }
+
+    if input.quantity <= Decimal::ZERO {
+        return Err(ApiError::bad_request("Quantity must be greater than zero"));
+    }
+
+    if reason.is_empty() {
+        return Err(ApiError::bad_request("Reason is required"));
+    }
+
+    let mut tx = pool.begin().await.map_err(ApiError::internal)?;
+
+    // Lock the selected batch so simultaneous adjustments
+    // cannot overwrite one another.
+    let batch = sqlx::query_as::<_, (Uuid, Decimal)>(
+        r#"
+        SELECT id, quantity_on_hand
+        FROM product_batches
+        WHERE id = $1
+          AND product_id = $2
+          AND is_active = TRUE
+        FOR UPDATE
+        "#,
+    )
+    .bind(input.batch_id)
+    .bind(input.product_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let (batch_id, before) = match batch {
+        Some(batch) => batch,
+        None => {
+            return Err(ApiError::not_found(
+                "Active batch not found for this product",
+            ));
+        }
+    };
+
+    let after = match movement_type.as_str() {
+        "IN" => before + input.quantity,
+        "OUT" => before - input.quantity,
+        "ADJUSTMENT" => input.quantity,
+        _ => unreachable!(),
+    };
+
+    if after < Decimal::ZERO {
+        return Err(ApiError::conflict("Insufficient stock for this stock-out"));
+    }
+
+    let change = after - before;
+
+    if change == Decimal::ZERO {
+        return Err(ApiError::bad_request(
+            "Adjustment does not change the current stock",
+        ));
+    }
+
+    sqlx::query(
+        r#"
+        UPDATE product_batches
+        SET quantity_on_hand = $1,
+            updated_at = NOW()
+        WHERE id = $2
+        "#,
+    )
+    .bind(after)
+    .bind(batch_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let movement = sqlx::query_as::<_, StockMovement>(
+        r#"
+        INSERT INTO stock_movements (
+            product_id,
+            batch_id,
+            movement_type,
+            quantity_change,
+            quantity_before,
+            quantity_after,
+            reason
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+
+        RETURNING
+            id,
+            product_id,
+            batch_id,
+            movement_type,
+            quantity_change,
+            quantity_before,
+            quantity_after,
+            reason,
+            created_at
+        "#,
+    )
+    .bind(input.product_id)
+    .bind(batch_id)
+    .bind(&movement_type)
+    .bind(change)
+    .bind(before)
+    .bind(after)
+    .bind(reason)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    tx.commit().await.map_err(ApiError::internal)?;
+
+    Ok((StatusCode::CREATED, Json(movement)))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MovementQuery {
+    pub page: Option<i64>,
+    pub limit: Option<i64>,
+    pub product_id: Option<Uuid>,
+    pub batch_id: Option<Uuid>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MovementListResponse {
+    pub data: Vec<StockMovement>,
+    pub page: i64,
+    pub limit: i64,
+    pub total: i64,
+}
+
+pub async fn list_stock_adjustments(
+    State(pool): State<PgPool>,
+    Query(params): Query<MovementQuery>,
+) -> Result<Json<MovementListResponse>, ApiError> {
+    let page = params.page.unwrap_or(1).max(1);
+    let limit = params.limit.unwrap_or(25).clamp(1, 100);
+    let offset = (page - 1) * limit;
+
+    let total: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM stock_movements
+        WHERE ($1::UUID IS NULL OR product_id = $1)
+          AND ($2::UUID IS NULL OR batch_id = $2)
+        "#,
+    )
+    .bind(params.product_id)
+    .bind(params.batch_id)
+    .fetch_one(&pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let data = sqlx::query_as::<_, StockMovement>(
+        r#"
+        SELECT
+            id,
+            product_id,
+            batch_id,
+            movement_type,
+            quantity_change,
+            quantity_before,
+            quantity_after,
+            reason,
+            created_at
+        FROM stock_movements
+        WHERE ($1::UUID IS NULL OR product_id = $1)
+          AND ($2::UUID IS NULL OR batch_id = $2)
+        ORDER BY created_at DESC, id DESC
+        LIMIT $3 OFFSET $4
+        "#,
+    )
+    .bind(params.product_id)
+    .bind(params.batch_id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    Ok(Json(MovementListResponse {
+        data,
+        page,
+        limit,
+        total,
+    }))
+}
+
+pub async fn get_stock_adjustment(
+    State(pool): State<PgPool>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<StockMovement>, ApiError> {
+    let movement = sqlx::query_as::<_, StockMovement>(
+        r#"
+        SELECT
+            id,
+            product_id,
+            batch_id,
+            movement_type,
+            quantity_change,
+            quantity_before,
+            quantity_after,
+            reason,
+            created_at
+        FROM stock_movements
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(ApiError::internal)?
+    .ok_or_else(|| ApiError::not_found("Stock movement not found"))?;
+
+    Ok(Json(movement))
+}
+
+// ============================================================
+// API ERROR HANDLING
+// ============================================================
+
+pub struct ApiError {
+    status: StatusCode,
+    message: String,
+}
+
+impl ApiError {
+    fn bad_request(message: &str) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.to_owned(),
+        }
+    }
+
+    fn not_found(message: &str) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: message.to_owned(),
+        }
+    }
+
+    fn conflict(message: &str) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: message.to_owned(),
+        }
+    }
+
+    fn internal<E: std::fmt::Display>(error: E) -> Self {
+        tracing::error!("Inventory API error: {error}");
+
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "Inventory operation failed. Check backend logs.".to_owned(),
+        }
+    }
+}
+
+impl axum::response::IntoResponse for ApiError {
+    fn into_response(self) -> axum::response::Response {
+        (
+            self.status,
+            Json(serde_json::json!({
+                "error": self.message
+            })),
+        )
+            .into_response()
+    }
+}
+
+
+==================================================
+FILE: backend\src\routes\manufacturers.rs
+==================================================
+
+use axum::{
+    Json,
+    extract::{Query, State},
+    http::StatusCode,
+};
+use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
+use uuid::Uuid;
+
+#[derive(Debug, Deserialize)]
+pub struct ManufacturerQuery {
+    pub search: Option<String>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct Manufacturer {
+    pub id: Uuid,
+    pub name: String,
+    pub is_active: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ManufacturerList {
+    pub data: Vec<Manufacturer>,
+    pub total: i64,
+}
+
+pub async fn list_manufacturers(
+    State(pool): State<PgPool>,
+    Query(query): Query<ManufacturerQuery>,
+) -> Result<Json<ManufacturerList>, (StatusCode, String)> {
+    let search = query.search.unwrap_or_default().trim().to_string();
+
+    let limit = query.limit.unwrap_or(100).clamp(1, 500);
+
+    let total: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM manufacturers
+        WHERE is_active = TRUE
+          AND ($1 = '' OR name ILIKE '%' || $1 || '%')
+        "#,
+    )
+    .bind(&search)
+    .fetch_one(&pool)
+    .await
+    .map_err(internal_error)?;
+
+    let data = sqlx::query_as::<_, Manufacturer>(
+        r#"
+        SELECT id, name, is_active
+        FROM manufacturers
+        WHERE is_active = TRUE
+          AND ($1 = '' OR name ILIKE '%' || $1 || '%')
+        ORDER BY name ASC
+        LIMIT $2
+        "#,
+    )
+    .bind(&search)
+    .bind(limit)
+    .fetch_all(&pool)
+    .await
+    .map_err(internal_error)?;
+
+    Ok(Json(ManufacturerList { data, total }))
+}
+
+fn internal_error(error: sqlx::Error) -> (StatusCode, String) {
+    tracing::error!("Manufacturer query failed: {error}");
+
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Unable to load manufacturers".to_string(),
+    )
+}
+
+
+==================================================
+FILE: backend\src\routes\mod.rs
+==================================================
+
+pub mod brands;
+pub mod business_profile;
+pub mod compositions;
+pub mod health;
+pub mod hsn;
+pub mod inventory;
+pub mod manufacturers;
+pub mod parties;
+pub mod products;
+
+
+==================================================
+FILE: backend\src\routes\parties.rs
+==================================================
+
+use axum::{
+    Json, Router,
+    extract::{Path, Query, State},
+    http::StatusCode,
+    routing::get,
+};
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use sqlx::{PgPool, Postgres, Transaction};
+use uuid::Uuid;
+
+// ============================================================
+// REQUEST TYPES
+// ============================================================
+
+#[derive(Debug, Deserialize)]
+pub struct PartyQuery {
+    pub search: Option<String>,
+    pub role: Option<String>,
+    pub active: Option<bool>,
+    pub page: Option<i64>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PartyInput {
+    pub party_code: String,
+    pub name: String,
+    pub roles: Vec<String>,
+
+    pub contact_person: Option<String>,
+    pub phone: Option<String>,
+    pub alternate_phone: Option<String>,
+    pub email: Option<String>,
+    pub gstin: Option<String>,
+    pub pan: Option<String>,
+    pub drug_license_number: Option<String>,
+
+    pub billing_address: Option<String>,
+    pub shipping_address: Option<String>,
+    pub city: Option<String>,
+    pub district: Option<String>,
+    pub state: Option<String>,
+    pub pincode: Option<String>,
+    pub country: Option<String>,
+
+    pub opening_balance: Option<Decimal>,
+    pub opening_balance_type: Option<String>,
+    pub credit_limit: Option<Decimal>,
+    pub credit_days: Option<i32>,
+
+    pub notes: Option<String>,
+    pub is_active: Option<bool>,
+}
+
+// ============================================================
+// RESPONSE TYPES
+// ============================================================
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct Party {
+    pub id: Uuid,
+    pub party_code: String,
+    pub name: String,
+
+    pub contact_person: Option<String>,
+    pub phone: Option<String>,
+    pub alternate_phone: Option<String>,
+    pub email: Option<String>,
+    pub gstin: Option<String>,
+    pub pan: Option<String>,
+    pub drug_license_number: Option<String>,
+
+    pub billing_address: Option<String>,
+    pub shipping_address: Option<String>,
+    pub city: Option<String>,
+    pub district: Option<String>,
+    pub state: String,
+    pub pincode: String,
+    pub country: String,
+
+    pub opening_balance: Decimal,
+    pub opening_balance_type: String,
+    pub credit_limit: Decimal,
+    pub credit_days: i32,
+
+    pub notes: Option<String>,
+    pub is_active: bool,
+
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+
+    pub roles: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PartyList {
+    pub data: Vec<Party>,
+    pub page: i64,
+    pub limit: i64,
+    pub total: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ApiMessage {
+    pub message: String,
+}
+
+// ============================================================
+// ROUTER
+// ============================================================
+
+pub fn router() -> Router<PgPool> {
+    Router::new()
+        .route("/", get(list_parties).post(create_party))
+        .route(
+            "/{id}",
+            get(get_party).put(update_party).delete(deactivate_party),
+        )
+}
+
+// ============================================================
+// LIST PARTIES
+// GET /api/parties
+// GET /api/parties?role=SUPPLIER
+// GET /api/parties?role=CUSTOMER
+// GET /api/parties?search=abc&page=1&limit=50
+// ============================================================
+
+pub async fn list_parties(
+    State(pool): State<PgPool>,
+    Query(query): Query<PartyQuery>,
+) -> Result<Json<PartyList>, (StatusCode, String)> {
+    let search = query.search.unwrap_or_default().trim().to_string();
+
+    let role = query.role.unwrap_or_default().trim().to_uppercase();
+
+    if !role.is_empty() && !valid_role(&role) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Role must be SUPPLIER or CUSTOMER".to_string(),
+        ));
+    }
+
+    let page = query.page.unwrap_or(1).max(1);
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let offset = (page - 1).saturating_mul(limit);
+    let active = query.active.unwrap_or(true);
+
+    let total: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM parties p
+        WHERE
+            p.is_active = $1
+            AND (
+                $2 = ''
+                OR p.name ILIKE '%' || $2 || '%'
+                OR p.party_code ILIKE '%' || $2 || '%'
+                OR COALESCE(p.phone, '') ILIKE '%' || $2 || '%'
+                OR COALESCE(p.gstin, '') ILIKE '%' || $2 || '%'
+            )
+            AND (
+                $3 = ''
+                OR EXISTS (
+                    SELECT 1
+                    FROM party_roles r
+                    WHERE r.party_id = p.id
+                      AND r.role = $3
+                )
+            )
+        "#,
+    )
+    .bind(active)
+    .bind(&search)
+    .bind(&role)
+    .fetch_one(&pool)
+    .await
+    .map_err(internal_error)?;
+
+    let data = sqlx::query_as::<_, Party>(
+        r#"
+        SELECT
+            p.id,
+            p.party_code,
+            p.name,
+            p.contact_person,
+            p.phone,
+            p.alternate_phone,
+            p.email,
+            p.gstin,
+            p.pan,
+            p.drug_license_number,
+            p.billing_address,
+            p.shipping_address,
+            p.city,
+            p.district,
+            p.state,
+            p.pincode,
+            p.country,
+            p.opening_balance,
+            p.opening_balance_type,
+            p.credit_limit,
+            p.credit_days,
+            p.notes,
+            p.is_active,
+            p.created_at,
+            p.updated_at,
+            COALESCE(
+                ARRAY_AGG(pr.role ORDER BY pr.role)
+                    FILTER (WHERE pr.role IS NOT NULL),
+                ARRAY[]::VARCHAR[]
+            ) AS roles
+        FROM parties p
+        LEFT JOIN party_roles pr ON pr.party_id = p.id
+        WHERE
+            p.is_active = $1
+            AND (
+                $2 = ''
+                OR p.name ILIKE '%' || $2 || '%'
+                OR p.party_code ILIKE '%' || $2 || '%'
+                OR COALESCE(p.phone, '') ILIKE '%' || $2 || '%'
+                OR COALESCE(p.gstin, '') ILIKE '%' || $2 || '%'
+            )
+            AND (
+                $3 = ''
+                OR EXISTS (
+                    SELECT 1
+                    FROM party_roles r
+                    WHERE r.party_id = p.id
+                      AND r.role = $3
+                )
+            )
+        GROUP BY p.id
+        ORDER BY p.name ASC, p.id ASC
+        LIMIT $4 OFFSET $5
+        "#,
+    )
+    .bind(active)
+    .bind(&search)
+    .bind(&role)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&pool)
+    .await
+    .map_err(internal_error)?;
+
+    Ok(Json(PartyList {
+        data,
+        page,
+        limit,
+        total,
+    }))
+}
+
+// ============================================================
+// GET SINGLE PARTY
+// GET /api/parties/{id}
+// ============================================================
+
+pub async fn get_party(
+    State(pool): State<PgPool>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Party>, (StatusCode, String)> {
+    let party = load_party(&pool, id).await?;
+
+    Ok(Json(party))
+}
+
+// ============================================================
+// CREATE PARTY
+// POST /api/parties
+// ============================================================
+
+pub async fn create_party(
+    State(pool): State<PgPool>,
+    Json(input): Json<PartyInput>,
+) -> Result<(StatusCode, Json<Party>), (StatusCode, String)> {
+    let input = normalize_input(input)?;
+
+    let mut tx = pool.begin().await.map_err(internal_error)?;
+
+    let result = sqlx::query(
+        r#"
+        INSERT INTO parties (
+            party_code,
+            name,
+            contact_person,
+            phone,
+            alternate_phone,
+            email,
+            gstin,
+            pan,
+            drug_license_number,
+            billing_address,
+            shipping_address,
+            city,
+            district,
+            state,
+            pincode,
+            country,
+            opening_balance,
+            opening_balance_type,
+            credit_limit,
+            credit_days,
+            notes,
+            is_active
+        )
+        VALUES (
+            $1, $2, $3, $4, $5, $6,
+            $7, $8, $9, $10, $11, $12,
+            $13, $14, $15, $16, $17, $18,
+            $19, $20, $21, $22
+        )
+        "#,
+    )
+    .bind(&input.party_code)
+    .bind(&input.name)
+    .bind(&input.contact_person)
+    .bind(&input.phone)
+    .bind(&input.alternate_phone)
+    .bind(&input.email)
+    .bind(&input.gstin)
+    .bind(&input.pan)
+    .bind(&input.drug_license_number)
+    .bind(&input.billing_address)
+    .bind(&input.shipping_address)
+    .bind(&input.city)
+    .bind(&input.district)
+    .bind(&input.state)
+    .bind(&input.pincode)
+    .bind(&input.country)
+    .bind(input.opening_balance.unwrap_or(Decimal::ZERO))
+    .bind(input.opening_balance_type.as_deref().unwrap_or("PAYABLE"))
+    .bind(input.credit_limit.unwrap_or(Decimal::ZERO))
+    .bind(input.credit_days.unwrap_or(0))
+    .bind(&input.notes)
+    .bind(input.is_active.unwrap_or(true))
+    .execute(&mut *tx)
+    .await;
+
+    if let Err(error) = result {
+        return Err(database_error(error));
+    }
+
+    let id: Uuid = sqlx::query_scalar("SELECT id FROM parties WHERE party_code = $1")
+        .bind(&input.party_code)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(internal_error)?;
+
+    insert_roles(&mut tx, id, &input.roles).await?;
+
+    tx.commit().await.map_err(internal_error)?;
+
+    let party = load_party(&pool, id).await?;
+
+    Ok((StatusCode::CREATED, Json(party)))
+}
+
+// ============================================================
+// UPDATE PARTY
+// PUT /api/parties/{id}
+// ============================================================
+
+pub async fn update_party(
+    State(pool): State<PgPool>,
+    Path(id): Path<Uuid>,
+    Json(input): Json<PartyInput>,
+) -> Result<Json<Party>, (StatusCode, String)> {
+    let input = normalize_input(input)?;
+
+    let mut tx = pool.begin().await.map_err(internal_error)?;
+
+    let result = sqlx::query(
+        r#"
+        UPDATE parties SET
+            party_code = $2,
+            name = $3,
+            contact_person = $4,
+            phone = $5,
+            alternate_phone = $6,
+            email = $7,
+            gstin = $8,
+            pan = $9,
+            drug_license_number = $10,
+            billing_address = $11,
+            shipping_address = $12,
+            city = $13,
+            district = $14,
+            state = $15,
+            pincode = $16,
+            country = $17,
+            opening_balance = $18,
+            opening_balance_type = $19,
+            credit_limit = $20,
+            credit_days = $21,
+            notes = $22,
+            is_active = $23,
+            updated_at = NOW()
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .bind(&input.party_code)
+    .bind(&input.name)
+    .bind(&input.contact_person)
+    .bind(&input.phone)
+    .bind(&input.alternate_phone)
+    .bind(&input.email)
+    .bind(&input.gstin)
+    .bind(&input.pan)
+    .bind(&input.drug_license_number)
+    .bind(&input.billing_address)
+    .bind(&input.shipping_address)
+    .bind(&input.city)
+    .bind(&input.district)
+    .bind(&input.state)
+    .bind(&input.pincode)
+    .bind(&input.country)
+    .bind(input.opening_balance.unwrap_or(Decimal::ZERO))
+    .bind(input.opening_balance_type.as_deref().unwrap_or("PAYABLE"))
+    .bind(input.credit_limit.unwrap_or(Decimal::ZERO))
+    .bind(input.credit_days.unwrap_or(0))
+    .bind(&input.notes)
+    .bind(input.is_active.unwrap_or(true))
+    .execute(&mut *tx)
+    .await;
+
+    match result {
+        Ok(result) if result.rows_affected() == 0 => {
+            return Err((StatusCode::NOT_FOUND, "Party not found".to_string()));
+        }
+        Err(error) => return Err(database_error(error)),
+        _ => {}
+    }
+
+    sqlx::query("DELETE FROM party_roles WHERE party_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal_error)?;
+
+    insert_roles(&mut tx, id, &input.roles).await?;
+
+    tx.commit().await.map_err(internal_error)?;
+
+    Ok(Json(load_party(&pool, id).await?))
+}
+
+// ============================================================
+// DEACTIVATE PARTY
+// DELETE /api/parties/{id}
+// Soft delete: keeps historical references intact.
+// ============================================================
+
+pub async fn deactivate_party(
+    State(pool): State<PgPool>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ApiMessage>, (StatusCode, String)> {
+    let result = sqlx::query(
+        r#"
+        UPDATE parties
+        SET is_active = FALSE, updated_at = NOW()
+        WHERE id = $1 AND is_active = TRUE
+        "#,
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .map_err(internal_error)?;
+
+    if result.rows_affected() == 0 {
+        return Err((StatusCode::NOT_FOUND, "Active party not found".to_string()));
+    }
+
+    Ok(Json(ApiMessage {
+        message: "Party deactivated successfully".to_string(),
+    }))
+}
+
+// ============================================================
+// SHARED PARTY LOADER
+// ============================================================
+
+async fn load_party(pool: &PgPool, id: Uuid) -> Result<Party, (StatusCode, String)> {
+    sqlx::query_as::<_, Party>(
+        r#"
+        SELECT
+            p.id,
+            p.party_code,
+            p.name,
+            p.contact_person,
+            p.phone,
+            p.alternate_phone,
+            p.email,
+            p.gstin,
+            p.pan,
+            p.drug_license_number,
+            p.billing_address,
+            p.shipping_address,
+            p.city,
+            p.district,
+            p.state,
+            p.pincode,
+            p.country,
+            p.opening_balance,
+            p.opening_balance_type,
+            p.credit_limit,
+            p.credit_days,
+            p.notes,
+            p.is_active,
+            p.created_at,
+            p.updated_at,
+            COALESCE(
+                ARRAY_AGG(pr.role ORDER BY pr.role)
+                    FILTER (WHERE pr.role IS NOT NULL),
+                ARRAY[]::VARCHAR[]
+            ) AS roles
+        FROM parties p
+        LEFT JOIN party_roles pr ON pr.party_id = p.id
+        WHERE p.id = $1
+        GROUP BY p.id
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .map_err(internal_error)?
+    .ok_or((StatusCode::NOT_FOUND, "Party not found".to_string()))
+}
+
+// ============================================================
+// ROLE MANAGEMENT
+// ============================================================
+
+async fn insert_roles(
+    tx: &mut Transaction<'_, Postgres>,
+    party_id: Uuid,
+    roles: &[String],
+) -> Result<(), (StatusCode, String)> {
+    for role in roles {
+        sqlx::query("INSERT INTO party_roles (party_id, role) VALUES ($1, $2)")
+            .bind(party_id)
+            .bind(role)
+            .execute(&mut **tx)
+            .await
+            .map_err(database_error)?;
+    }
+
+    Ok(())
+}
+
+// ============================================================
+// INPUT VALIDATION
+// ============================================================
+
+fn normalize_input(mut input: PartyInput) -> Result<PartyInput, (StatusCode, String)> {
+    input.party_code = input.party_code.trim().to_uppercase();
+    input.name = input.name.trim().to_string();
+
+    if input.party_code.is_empty() || input.name.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Party code and name are required".to_string(),
+        ));
+    }
+
+    if input.party_code.len() > 50 || input.name.len() > 250 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Party code or name exceeds the allowed length".to_string(),
+        ));
+    }
+
+    input.roles = input
+        .roles
+        .iter()
+        .map(|role| role.trim().to_uppercase())
+        .collect();
+
+    input.roles.sort();
+    input.roles.dedup();
+
+    if input.roles.is_empty() || input.roles.iter().any(|role| !valid_role(role)) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Select at least one valid role: SUPPLIER or CUSTOMER".to_string(),
+        ));
+    }
+
+    let balance_type = input
+        .opening_balance_type
+        .as_deref()
+        .unwrap_or("PAYABLE")
+        .trim()
+        .to_uppercase();
+
+    if !matches!(balance_type.as_str(), "PAYABLE" | "RECEIVABLE" | "ADVANCE") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid opening balance type".to_string(),
+        ));
+    }
+
+    input.opening_balance_type = Some(balance_type);
+
+    let opening = input.opening_balance.unwrap_or(Decimal::ZERO);
+    let credit_limit = input.credit_limit.unwrap_or(Decimal::ZERO);
+    let credit_days = input.credit_days.unwrap_or(0);
+
+    if opening < Decimal::ZERO || credit_limit < Decimal::ZERO || credit_days < 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Balances, credit limit and credit days cannot be negative".to_string(),
+        ));
+    }
+
+    input.opening_balance = Some(opening);
+    input.credit_limit = Some(credit_limit);
+    input.credit_days = Some(credit_days);
+    input.is_active = Some(input.is_active.unwrap_or(true));
+
+    input.state = Some(
+        input
+            .state
+            .unwrap_or_else(|| "Rajasthan".to_string())
+            .trim()
+            .to_string(),
+    );
+
+    input.pincode = Some(input.pincode.unwrap_or_default().trim().to_string());
+
+    input.country = Some(
+        input
+            .country
+            .unwrap_or_else(|| "India".to_string())
+            .trim()
+            .to_string(),
+    );
+
+    normalize_optional(&mut input.contact_person);
+    normalize_optional(&mut input.phone);
+    normalize_optional(&mut input.alternate_phone);
+    normalize_optional(&mut input.email);
+    normalize_optional(&mut input.gstin);
+    normalize_optional(&mut input.pan);
+    normalize_optional(&mut input.drug_license_number);
+    normalize_optional(&mut input.billing_address);
+    normalize_optional(&mut input.shipping_address);
+    normalize_optional(&mut input.city);
+    normalize_optional(&mut input.district);
+    normalize_optional(&mut input.notes);
+
+    if let Some(email) = &input.email {
+        if !email.contains('@') || email.starts_with('@') || email.ends_with('@') {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Email address is invalid".to_string(),
+            ));
+        }
+    }
+
+    if let Some(gstin) = &input.gstin {
+        if gstin.len() != 15 || !gstin.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "GSTIN must contain 15 alphanumeric characters".to_string(),
+            ));
+        }
+    }
+
+    if let Some(pan) = &input.pan {
+        let chars: Vec<char> = pan.chars().collect();
+
+        let valid = chars.len() == 10
+            && chars[0..5].iter().all(|c| c.is_ascii_uppercase())
+            && chars[5..9].iter().all(|c| c.is_ascii_digit())
+            && chars[9].is_ascii_uppercase();
+
+        if !valid {
+            return Err((StatusCode::BAD_REQUEST, "PAN format is invalid".to_string()));
+        }
+    }
+
+    if let Some(pincode) = &input.pincode {
+        if !pincode.is_empty()
+            && (pincode.len() != 6 || !pincode.chars().all(|c| c.is_ascii_digit()))
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Pincode must contain 6 digits".to_string(),
+            ));
+        }
+    }
+
+    Ok(input)
+}
+
+fn normalize_optional(value: &mut Option<String>) {
+    if let Some(text) = value {
+        let trimmed = text.trim().to_string();
+
+        *value = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        };
+    }
+}
+
+fn valid_role(role: &str) -> bool {
+    matches!(role, "SUPPLIER" | "CUSTOMER")
+}
+
+// ============================================================
+// ERROR HANDLING
+// ============================================================
+
+fn internal_error(error: sqlx::Error) -> (StatusCode, String) {
+    tracing::error!("Party database operation failed: {error}");
+
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Unable to process party request".to_string(),
+    )
+}
+
+fn database_error(error: sqlx::Error) -> (StatusCode, String) {
+    if let sqlx::Error::Database(db_error) = &error {
+        match db_error.code().as_deref() {
+            Some("23505") => {
+                return (
+                    StatusCode::CONFLICT,
+                    "Party code already exists".to_string(),
+                );
+            }
+            Some("23503") => {
+                return (
+                    StatusCode::CONFLICT,
+                    "Party is referenced by another record".to_string(),
+                );
+            }
+            Some("23514") | Some("22P02") => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "Party data violates a database constraint".to_string(),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    internal_error(error)
+}
+
+
+==================================================
+FILE: backend\src\routes\products.rs
+==================================================
+
+use axum::{
+    Json,
+    extract::{Path, Query, State},
+    http::StatusCode,
+};
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
+use uuid::Uuid;
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Request models
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+#[derive(Debug, Deserialize)]
+pub struct ProductQuery {
+    pub search: Option<String>,
+    pub page: Option<i64>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ProductInput {
+    pub sku: String,
+    pub name: String,
+
+    // Legacy field retained for backward compatibility.
+    pub generic_name: Option<String>,
+
+    // Legacy brand text and new brand master relationship.
+    pub brand_name: Option<String>,
+    pub brand_id: Option<Uuid>,
+
+    // None = preserve existing mappings on update.
+    // Some([]) = remove all composition mappings.
+    #[serde(default)]
+    pub composition_ids: Option<Vec<Uuid>>,
+
+    pub dosage_form: Option<String>,
+    pub strength: Option<String>,
+    pub pack_size: Option<String>,
+    pub unit: Option<String>,
+    pub hsn_code: Option<String>,
+    pub gst_rate: Option<Decimal>,
+    pub barcode: Option<String>,
+    pub is_prescription_required: Option<bool>,
+    pub is_active: Option<bool>,
+
+    pub schedule_class: Option<String>,
+    pub is_narcotic: Option<bool>,
+    pub units_per_pack: Option<Decimal>,
+}
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Response models
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct Product {
+    pub id: Uuid,
+    pub sku: String,
+    pub name: String,
+    pub generic_name: Option<String>,
+
+    pub brand_id: Option<Uuid>,
+    pub brand_name: Option<String>,
+
+    pub composition_ids: Vec<Uuid>,
+    pub composition_names: Vec<String>,
+
+    pub dosage_form: Option<String>,
+    pub strength: Option<String>,
+    pub pack_size: Option<String>,
+    pub unit: String,
+    pub hsn_code: Option<String>,
+    pub gst_rate: Decimal,
+    pub barcode: Option<String>,
+    pub is_prescription_required: bool,
+    pub is_active: bool,
+
+    pub schedule_class: String,
+    pub is_narcotic: bool,
+    pub units_per_pack: Decimal,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProductList {
+    pub data: Vec<Product>,
+    pub page: i64,
+    pub limit: i64,
+    pub total: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ApiError {
+    pub error: String,
+}
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Shared product SELECT
+// Static SQL avoids dynamic SQL safety errors.
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// GET /api/products
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+pub async fn list_products(
+    State(pool): State<PgPool>,
+    Query(query): Query<ProductQuery>,
+) -> Result<Json<ProductList>, (StatusCode, Json<ApiError>)> {
+    let page = query.page.unwrap_or(1).max(1);
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    let offset = (page - 1) * limit;
+    let search = query.search.unwrap_or_default().trim().to_owned();
+
+    let total: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM public.products p
+        LEFT JOIN public.brands b ON b.id = p.brand_id
+        WHERE $1 = ''
+           OR p.name ILIKE '%' || $1 || '%'
+           OR p.sku ILIKE '%' || $1 || '%'
+           OR COALESCE(p.generic_name, '') ILIKE '%' || $1 || '%'
+           OR COALESCE(b.name, p.brand_name, '') ILIKE '%' || $1 || '%'
+           OR EXISTS (
+               SELECT 1
+               FROM public.product_compositions pc
+               JOIN public.compositions c
+                   ON c.id = pc.composition_id
+               WHERE pc.product_id = p.id
+                 AND c.name ILIKE '%' || $1 || '%'
+           )
+        "#,
+    )
+    .bind(&search)
+    .fetch_one(&pool)
+    .await
+    .map_err(internal_error)?;
+
+    // Static SQL: no format!() and no dynamically constructed query.
+    let sql = r#"
+        SELECT
+            p.id,
+            p.sku,
+            p.name,
+            p.generic_name,
+            p.brand_id,
+            COALESCE(b.name, p.brand_name) AS brand_name,
+
+            COALESCE(
+                (
+                    SELECT array_agg(pc.composition_id ORDER BY c.name)
+                    FROM public.product_compositions pc
+                    JOIN public.compositions c
+                        ON c.id = pc.composition_id
+                    WHERE pc.product_id = p.id
+                ),
+                ARRAY[]::UUID[]
+            ) AS composition_ids,
+
+            COALESCE(
+                (
+                    SELECT array_agg(c.name ORDER BY c.name)
+                    FROM public.product_compositions pc
+                    JOIN public.compositions c
+                        ON c.id = pc.composition_id
+                    WHERE pc.product_id = p.id
+                ),
+                ARRAY[]::TEXT[]
+            ) AS composition_names,
+
+            p.dosage_form,
+            p.strength,
+            p.pack_size,
+            p.unit,
+            p.hsn_code,
+            p.gst_rate,
+            p.barcode,
+            p.is_prescription_required,
+            p.is_active,
+            p.schedule_class,
+            p.is_narcotic,
+            p.units_per_pack
+
+        FROM public.products p
+        LEFT JOIN public.brands b ON b.id = p.brand_id
+
+        WHERE $1 = ''
+           OR p.name ILIKE '%' || $1 || '%'
+           OR p.sku ILIKE '%' || $1 || '%'
+           OR COALESCE(p.generic_name, '') ILIKE '%' || $1 || '%'
+           OR COALESCE(b.name, p.brand_name, '') ILIKE '%' || $1 || '%'
+           OR EXISTS (
+               SELECT 1
+               FROM public.product_compositions pc
+               JOIN public.compositions c
+                   ON c.id = pc.composition_id
+               WHERE pc.product_id = p.id
+                 AND c.name ILIKE '%' || $1 || '%'
+           )
+
+        ORDER BY p.name, p.sku
+        LIMIT $2 OFFSET $3
+    "#;
+
+    let data = sqlx::query_as::<_, Product>(sql)
+        .bind(&search)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&pool)
+        .await
+        .map_err(internal_error)?;
+
+    Ok(Json(ProductList {
+        data,
+        page,
+        limit,
+        total,
+    }))
+}
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// GET /api/products/{id}
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+pub async fn get_product(
+    State(pool): State<PgPool>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Product>, (StatusCode, Json<ApiError>)> {
+    let product = fetch_product(&pool, id).await?;
+    Ok(Json(product))
+}
+
+async fn fetch_product(pool: &PgPool, id: Uuid) -> Result<Product, (StatusCode, Json<ApiError>)> {
+    sqlx::query_as::<_, Product>(
+        r#"
+        SELECT
+            p.id,
+            p.sku,
+            p.name,
+            p.generic_name,
+            p.brand_id,
+            COALESCE(b.name, p.brand_name) AS brand_name,
+
+            COALESCE(
+                (
+                    SELECT array_agg(pc.composition_id ORDER BY c.name)
+                    FROM public.product_compositions pc
+                    JOIN public.compositions c
+                        ON c.id = pc.composition_id
+                    WHERE pc.product_id = p.id
+                ),
+                ARRAY[]::UUID[]
+            ) AS composition_ids,
+
+            COALESCE(
+                (
+                    SELECT array_agg(c.name ORDER BY c.name)
+                    FROM public.product_compositions pc
+                    JOIN public.compositions c
+                        ON c.id = pc.composition_id
+                    WHERE pc.product_id = p.id
+                ),
+                ARRAY[]::TEXT[]
+            ) AS composition_names,
+
+            p.dosage_form,
+            p.strength,
+            p.pack_size,
+            p.unit,
+            p.hsn_code,
+            p.gst_rate,
+            p.barcode,
+            p.is_prescription_required,
+            p.is_active,
+            p.schedule_class,
+            p.is_narcotic,
+            p.units_per_pack
+
+        FROM public.products p
+        LEFT JOIN public.brands b ON b.id = p.brand_id
+        WHERE p.id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .map_err(internal_error)?
+    .ok_or_else(not_found)
+}
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// POST /api/products
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+pub async fn create_product(
+    State(pool): State<PgPool>,
+    Json(input): Json<ProductInput>,
+) -> Result<(StatusCode, Json<Product>), (StatusCode, Json<ApiError>)> {
+    let sku = input.sku.trim();
+    let name = input.name.trim();
+
+    validate_product(
+        sku,
+        name,
+        input.gst_rate,
+        input.schedule_class.as_deref(),
+        input.units_per_pack,
+    )?;
+
+    let schedule_class = normalized_schedule(input.schedule_class.as_deref());
+    let units_per_pack = input.units_per_pack.unwrap_or(Decimal::ONE);
+    let composition_ids = input.composition_ids.unwrap_or_default();
+
+    validate_composition_ids(&composition_ids)?;
+
+    let mut tx = pool.begin().await.map_err(internal_error)?;
+
+    let id: Uuid = sqlx::query_scalar(
+        r#"
+        INSERT INTO public.products (
+            sku,
+            name,
+            generic_name,
+            brand_name,
+            brand_id,
+            dosage_form,
+            strength,
+            pack_size,
+            unit,
+            hsn_code,
+            gst_rate,
+            barcode,
+            is_prescription_required,
+            is_active,
+            schedule_class,
+            is_narcotic,
+            units_per_pack
+        )
+        VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8,
+            COALESCE($9, 'PCS'),
+            $10,
+            COALESCE($11, 0),
+            $12,
+            COALESCE($13, false),
+            COALESCE($14, true),
+            $15,
+            COALESCE($16, false),
+            $17
+        )
+        RETURNING id
+        "#,
+    )
+    .bind(sku)
+    .bind(name)
+    .bind(input.generic_name)
+    .bind(input.brand_name)
+    .bind(input.brand_id)
+    .bind(input.dosage_form)
+    .bind(input.strength)
+    .bind(input.pack_size)
+    .bind(input.unit)
+    .bind(input.hsn_code)
+    .bind(input.gst_rate)
+    .bind(input.barcode)
+    .bind(input.is_prescription_required)
+    .bind(input.is_active)
+    .bind(schedule_class)
+    .bind(input.is_narcotic)
+    .bind(units_per_pack)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(write_error)?;
+
+    replace_compositions(&mut tx, id, &composition_ids).await?;
+
+    tx.commit().await.map_err(internal_error)?;
+
+    let product = fetch_product(&pool, id).await?;
+
+    Ok((StatusCode::CREATED, Json(product)))
+}
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// PUT /api/products/{id}
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+pub async fn update_product(
+    State(pool): State<PgPool>,
+    Path(id): Path<Uuid>,
+    Json(input): Json<ProductInput>,
+) -> Result<Json<Product>, (StatusCode, Json<ApiError>)> {
+    let sku = input.sku.trim();
+    let name = input.name.trim();
+
+    validate_product(
+        sku,
+        name,
+        input.gst_rate,
+        input.schedule_class.as_deref(),
+        input.units_per_pack,
+    )?;
+
+    let schedule_class = normalized_schedule(input.schedule_class.as_deref());
+
+    let mut tx = pool.begin().await.map_err(internal_error)?;
+
+    let result = sqlx::query(
+        r#"
+        UPDATE public.products
+        SET
+            sku = $2,
+            name = $3,
+            generic_name = $4,
+            brand_name = $5,
+
+            -- Preserve the existing relationship if an older client
+            -- does not send brand_id.
+            brand_id = COALESCE($6, brand_id),
+
+            dosage_form = $7,
+            strength = $8,
+            pack_size = $9,
+            unit = COALESCE($10, 'PCS'),
+            hsn_code = $11,
+            gst_rate = COALESCE($12, 0),
+            barcode = $13,
+            is_prescription_required = COALESCE($14, false),
+            is_active = COALESCE($15, true),
+            schedule_class = $16,
+            is_narcotic = COALESCE($17, false),
+            units_per_pack = COALESCE($18, 1),
+            updated_at = NOW()
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .bind(sku)
+    .bind(name)
+    .bind(&input.generic_name)
+    .bind(&input.brand_name)
+    .bind(input.brand_id)
+    .bind(&input.dosage_form)
+    .bind(&input.strength)
+    .bind(&input.pack_size)
+    .bind(&input.unit)
+    .bind(&input.hsn_code)
+    .bind(input.gst_rate)
+    .bind(&input.barcode)
+    .bind(input.is_prescription_required)
+    .bind(input.is_active)
+    .bind(schedule_class)
+    .bind(input.is_narcotic)
+    .bind(input.units_per_pack)
+    .execute(&mut *tx)
+    .await
+    .map_err(write_error)?;
+
+    if result.rows_affected() == 0 {
+        return Err(not_found());
+    }
+
+    if let Some(composition_ids) = input.composition_ids {
+        validate_composition_ids(&composition_ids)?;
+        replace_compositions(&mut tx, id, &composition_ids).await?;
+    }
+
+    tx.commit().await.map_err(internal_error)?;
+
+    let product = fetch_product(&pool, id).await?;
+    Ok(Json(product))
+}
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Composition relationship helpers
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+fn validate_composition_ids(ids: &[Uuid]) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let mut unique = std::collections::HashSet::new();
+
+    for id in ids {
+        if !unique.insert(*id) {
+            return Err(bad_request("Duplicate composition IDs are not allowed"));
+        }
+    }
+
+    Ok(())
+}
+
+async fn replace_compositions(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    product_id: Uuid,
+    composition_ids: &[Uuid],
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    sqlx::query("DELETE FROM public.product_compositions WHERE product_id = $1")
+        .bind(product_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(write_error)?;
+
+    for composition_id in composition_ids {
+        sqlx::query(
+            r#"
+            INSERT INTO public.product_compositions (
+                product_id,
+                composition_id
+            )
+            VALUES ($1, $2)
+            "#,
+        )
+        .bind(product_id)
+        .bind(composition_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(write_error)?;
+    }
+
+    Ok(())
+}
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// DELETE /api/products/{id}
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+pub async fn delete_product(
+    State(pool): State<PgPool>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    let result = sqlx::query("DELETE FROM public.products WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .map_err(write_error)?;
+
+    if result.rows_affected() == 0 {
+        return Err(not_found());
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Validation
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+fn normalized_schedule(value: Option<&str>) -> String {
+    value.unwrap_or("OTC").trim().to_uppercase()
+}
+
+fn validate_product(
+    sku: &str,
+    name: &str,
+    gst_rate: Option<Decimal>,
+    schedule_class: Option<&str>,
+    units_per_pack: Option<Decimal>,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    if sku.is_empty() || name.is_empty() {
+        return Err(bad_request("SKU and product name are required"));
+    }
+
+    if sku.len() > 80 || name.len() > 250 {
+        return Err(bad_request(
+            "SKU or product name exceeds the allowed length",
+        ));
+    }
+
+    if let Some(rate) = gst_rate {
+        if rate < Decimal::ZERO || rate > Decimal::from(100) {
+            return Err(bad_request("GST rate must be between 0 and 100"));
+        }
+    }
+
+    if let Some(class) = schedule_class {
+        let class = class.trim().to_uppercase();
+
+        if !["OTC", "H", "H1", "X"].contains(&class.as_str()) {
+            return Err(bad_request("Schedule class must be OTC, H, H1 or X"));
+        }
+    }
+
+    if let Some(units) = units_per_pack {
+        if units <= Decimal::ZERO {
+            return Err(bad_request("Units per pack must be greater than zero"));
+        }
+    }
+
+    Ok(())
+}
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Error responses
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+fn bad_request(message: &str) -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ApiError {
+            error: message.to_owned(),
+        }),
+    )
+}
+
+fn not_found() -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ApiError {
+            error: "Product not found".to_owned(),
+        }),
+    )
+}
+
+fn internal_error(error: sqlx::Error) -> (StatusCode, Json<ApiError>) {
+    tracing::error!("Product query failed: {error}");
+
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ApiError {
+            error: "Database query failed".to_owned(),
+        }),
+    )
+}
+
+fn write_error(error: sqlx::Error) -> (StatusCode, Json<ApiError>) {
+    if let sqlx::Error::Database(ref db_error) = error {
+        if db_error.is_unique_violation() {
+            return (
+                StatusCode::CONFLICT,
+                Json(ApiError {
+                    error: "SKU or another unique field already exists".to_owned(),
+                }),
+            );
+        }
+
+        if db_error.is_foreign_key_violation() {
+            return (
+                StatusCode::CONFLICT,
+                Json(ApiError {
+                    error: "A referenced brand, composition or related record does not exist, or the product is referenced elsewhere".to_owned(),
+                }),
+            );
+        }
+
+        if db_error.is_check_violation() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: "One or more product values violate a database constraint".to_owned(),
+                }),
+            );
+        }
+    }
+
+    tracing::error!("Product write failed: {error}");
+
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ApiError {
+            error: "Product operation failed".to_owned(),
+        }),
+    )
+}
+

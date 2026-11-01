@@ -1,0 +1,329 @@
+const API_BASE_URL = 'http://127.0.0.1:8080/api'
+
+// ─── Products ───────────────────────────────────────────────
+
+export interface Product {
+  id: string
+  sku: string
+  name: string
+  generic_name: string | null
+  brand_name: string | null
+  dosage_form: string | null
+  strength: string | null
+  pack_size: string | null
+  unit: string
+  hsn_code: string | null
+  gst_rate: number
+  barcode: string | null
+  is_prescription_required: boolean
+  is_active: boolean
+}
+
+export interface ProductInput {
+  sku: string
+  name: string
+  generic_name?: string | null
+  brand_name?: string | null
+  dosage_form?: string | null
+  strength?: string | null
+  pack_size?: string | null
+  unit?: string
+  hsn_code?: string | null
+  gst_rate?: number
+  barcode?: string | null
+  is_prescription_required?: boolean
+  is_active?: boolean
+}
+
+export interface ProductList {
+  data: Product[]
+  page: number
+  limit: number
+  total: number
+}
+
+// ─── Brands ─────────────────────────────────────────────────
+
+export interface Brand {
+  id: string
+  name: string
+  manufacturer_id: string | null
+  description: string | null
+  is_active: boolean
+}
+
+export interface BrandInput {
+  name: string
+  manufacturer_id?: string | null
+  description?: string | null
+  is_active?: boolean
+}
+
+// ─── Compositions ───────────────────────────────────────────
+
+export interface Composition {
+  id: string
+  name: string
+  description: string | null
+  is_active: boolean
+}
+
+export interface CompositionInput {
+  name: string
+  description?: string | null
+  is_active?: boolean
+}
+
+// ─── Shared List Response ───────────────────────────────────
+
+export interface ListResponse<T> {
+  data: T[]
+  page: number
+  limit: number
+  total: number
+}
+
+// ─── Inventory ──────────────────────────────────────────────
+
+export interface InventorySummary {
+  total_products: number
+  total_batches: number
+  total_units: number
+  low_stock: number
+  out_of_stock: number
+  expiring_soon: number
+  expired: number
+  stock_value: number
+}
+
+export interface InventoryBatch {
+  id: string
+  product_id: string
+  product_name: string
+  sku: string
+  brand_name: string | null
+  batch_number: string
+  manufacturing_date: string | null
+  expiry_date: string | null
+  quantity: number
+  reorder_level: number
+  unit: string
+  purchase_rate: number
+  mrp: number
+  selling_rate: number
+}
+
+export interface InventoryBatchList {
+  data: InventoryBatch[]
+  page: number
+  limit: number
+  total: number
+}
+
+export interface StockMovement {
+  id: string
+  product_id: string
+  batch_id: string
+  movement_type: string
+  quantity_change: number
+  quantity_before: number
+  quantity_after: number
+  reason: string
+  created_at: string
+}
+
+// ─── API ────────────────────────────────────────────────────
+
+export function useApi() {
+  // Products
+
+  async function getProducts(
+    params: { search?: string; page?: number; limit?: number } = {},
+  ) {
+    return await $fetch<ProductList>(`${API_BASE_URL}/products`, {
+      query: params,
+    })
+  }
+
+  async function getProduct(id: string) {
+    return await $fetch<Product>(
+      `${API_BASE_URL}/products/${encodeURIComponent(id)}`,
+    )
+  }
+
+  async function createProduct(payload: ProductInput) {
+    return await $fetch<Product>(`${API_BASE_URL}/products`, {
+      method: 'POST',
+      body: payload,
+    })
+  }
+
+  async function updateProduct(id: string, payload: ProductInput) {
+    return await $fetch<Product>(
+      `${API_BASE_URL}/products/${encodeURIComponent(id)}`,
+      {
+        method: 'PUT',
+        body: payload,
+      },
+    )
+  }
+
+  async function deleteProduct(id: string) {
+    return await $fetch(
+      `${API_BASE_URL}/products/${encodeURIComponent(id)}`,
+      { method: 'DELETE' },
+    )
+  }
+
+  // Brands
+
+  async function getBrands(
+    params: { search?: string; page?: number; limit?: number } = {},
+  ) {
+    return await $fetch<ListResponse<Brand>>(`${API_BASE_URL}/brands`, {
+      query: params,
+    })
+  }
+
+  async function createBrand(payload: BrandInput) {
+    return await $fetch<Brand>(`${API_BASE_URL}/brands`, {
+      method: 'POST',
+      body: payload,
+    })
+  }
+
+  async function updateBrand(id: string, payload: BrandInput) {
+    return await $fetch<Brand>(
+      `${API_BASE_URL}/brands/${encodeURIComponent(id)}`,
+      {
+        method: 'PUT',
+        body: payload,
+      },
+    )
+  }
+
+  async function deleteBrand(id: string) {
+    return await $fetch<void>(
+      `${API_BASE_URL}/brands/${encodeURIComponent(id)}`,
+      { method: 'DELETE' },
+    )
+  }
+
+  // Compositions
+
+  async function getCompositions(
+    params: { search?: string; page?: number; limit?: number } = {},
+  ) {
+    return await $fetch<ListResponse<Composition>>(
+      `${API_BASE_URL}/compositions`,
+      { query: params },
+    )
+  }
+
+  async function createComposition(payload: CompositionInput) {
+    return await $fetch<Composition>(`${API_BASE_URL}/compositions`, {
+      method: 'POST',
+      body: payload,
+    })
+  }
+
+  async function updateComposition(
+    id: string,
+    payload: CompositionInput,
+  ) {
+    return await $fetch<Composition>(
+      `${API_BASE_URL}/compositions/${encodeURIComponent(id)}`,
+      {
+        method: 'PUT',
+        body: payload,
+      },
+    )
+  }
+
+  async function deleteComposition(id: string) {
+    return await $fetch<void>(
+      `${API_BASE_URL}/compositions/${encodeURIComponent(id)}`,
+      { method: 'DELETE' },
+    )
+  }
+
+  // Inventory
+
+  async function getInventorySummary() {
+    return await $fetch<InventorySummary>(
+      `${API_BASE_URL}/inventory/summary`,
+    )
+  }
+
+  async function getInventoryBatches(
+    params: {
+      search?: string
+      page?: number
+      limit?: number
+      stock_status?: string
+      expiry_status?: string
+    } = {},
+  ) {
+    return await $fetch<InventoryBatchList>(
+      `${API_BASE_URL}/inventory/batches`,
+      { query: params },
+    )
+  }
+
+  async function getStockAdjustments(
+    params: {
+      page?: number
+      limit?: number
+      product_id?: string
+      batch_id?: string
+    } = {},
+  ) {
+    return await $fetch<ListResponse<StockMovement>>(
+      `${API_BASE_URL}/inventory/adjustments`,
+      { query: params },
+    )
+  }
+
+  async function createStockAdjustment(payload: {
+    product_id: string
+    batch_id: string
+    movement_type: 'IN' | 'OUT' | 'ADJUSTMENT'
+    quantity: number
+    reason: string
+  }) {
+    return await $fetch<StockMovement>(
+      `${API_BASE_URL}/inventory/adjustments`,
+      {
+        method: 'POST',
+        body: payload,
+      },
+    )
+  }
+
+  return {
+    // Products
+    getProducts,
+    getProduct,
+    createProduct,
+    updateProduct,
+    deleteProduct,
+
+    // Brands
+    getBrands,
+    createBrand,
+    updateBrand,
+    deleteBrand,
+
+    // Compositions
+    getCompositions,
+    createComposition,
+    updateComposition,
+    deleteComposition,
+
+    // Inventory
+    getInventorySummary,
+    getInventoryBatches,
+    getStockAdjustments,
+    createStockAdjustment,
+  }
+}

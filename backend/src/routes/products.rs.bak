@@ -1,0 +1,415 @@
+use axum::{
+    Json,
+    extract::{Path, Query, State},
+    http::StatusCode,
+};
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
+use uuid::Uuid;
+
+// ─────────────────────────────────────────────
+// Request models
+// ─────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct ProductQuery {
+    pub search: Option<String>,
+    pub page: Option<i64>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ProductInput {
+    pub sku: String,
+    pub name: String,
+    pub generic_name: Option<String>,
+    pub brand_name: Option<String>,
+    pub dosage_form: Option<String>,
+    pub strength: Option<String>,
+    pub pack_size: Option<String>,
+    pub unit: Option<String>,
+    pub hsn_code: Option<String>,
+    pub gst_rate: Option<Decimal>,
+    pub barcode: Option<String>,
+    pub is_prescription_required: Option<bool>,
+    pub is_active: Option<bool>,
+}
+
+// ─────────────────────────────────────────────
+// Response models
+// ─────────────────────────────────────────────
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct Product {
+    pub id: Uuid,
+    pub sku: String,
+    pub name: String,
+    pub generic_name: Option<String>,
+    pub brand_name: Option<String>,
+    pub dosage_form: Option<String>,
+    pub strength: Option<String>,
+    pub pack_size: Option<String>,
+    pub unit: String,
+    pub hsn_code: Option<String>,
+    pub gst_rate: Decimal,
+    pub barcode: Option<String>,
+    pub is_prescription_required: bool,
+    pub is_active: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProductList {
+    pub data: Vec<Product>,
+    pub page: i64,
+    pub limit: i64,
+    pub total: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ApiError {
+    pub error: String,
+}
+
+// ─────────────────────────────────────────────
+// Shared SQL projection
+// ─────────────────────────────────────────────
+
+const PRODUCT_COLUMNS: &str = "
+    id, sku, name, generic_name, brand_name,
+    dosage_form, strength, pack_size, unit,
+    hsn_code, gst_rate, barcode,
+    is_prescription_required, is_active
+";
+
+// ─────────────────────────────────────────────
+// GET /api/products
+// Supports search and pagination.
+// ─────────────────────────────────────────────
+
+pub async fn list_products(
+    State(pool): State<PgPool>,
+    Query(query): Query<ProductQuery>,
+) -> Result<Json<ProductList>, (StatusCode, Json<ApiError>)> {
+    let page = query.page.unwrap_or(1).max(1);
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    let offset = (page - 1) * limit;
+
+    let search = query.search.unwrap_or_default().trim().to_owned();
+
+    let total: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM public.products
+        WHERE $1 = ''
+           OR name ILIKE '%' || $1 || '%'
+           OR sku ILIKE '%' || $1 || '%'
+           OR COALESCE(generic_name, '') ILIKE '%' || $1 || '%'
+           OR COALESCE(brand_name, '') ILIKE '%' || $1 || '%'
+        "#,
+    )
+    .bind(&search)
+    .fetch_one(&pool)
+    .await
+    .map_err(internal_error)?;
+
+    let data = sqlx::query_as::<_, Product>(
+        r#"
+        SELECT
+            id, sku, name, generic_name, brand_name,
+            dosage_form, strength, pack_size, unit,
+            hsn_code, gst_rate, barcode,
+            is_prescription_required, is_active
+        FROM public.products
+        WHERE $1 = ''
+           OR name ILIKE '%' || $1 || '%'
+           OR sku ILIKE '%' || $1 || '%'
+           OR COALESCE(generic_name, '') ILIKE '%' || $1 || '%'
+           OR COALESCE(brand_name, '') ILIKE '%' || $1 || '%'
+        ORDER BY name, sku
+        LIMIT $2 OFFSET $3
+        "#,
+    )
+    .bind(&search)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&pool)
+    .await
+    .map_err(internal_error)?;
+
+    Ok(Json(ProductList {
+        data,
+        page,
+        limit,
+        total,
+    }))
+}
+
+// ─────────────────────────────────────────────
+// GET /api/products/{id}
+// View one product.
+// ─────────────────────────────────────────────
+
+pub async fn get_product(
+    State(pool): State<PgPool>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Product>, (StatusCode, Json<ApiError>)> {
+    let product = sqlx::query_as::<_, Product>(
+        r#"
+        SELECT
+            id, sku, name, generic_name, brand_name,
+            dosage_form, strength, pack_size, unit,
+            hsn_code, gst_rate, barcode,
+            is_prescription_required, is_active
+        FROM public.products
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(internal_error)?
+    .ok_or_else(not_found)?;
+
+    Ok(Json(product))
+}
+
+// ─────────────────────────────────────────────
+// POST /api/products
+// Create a product.
+// ─────────────────────────────────────────────
+
+pub async fn create_product(
+    State(pool): State<PgPool>,
+    Json(input): Json<ProductInput>,
+) -> Result<(StatusCode, Json<Product>), (StatusCode, Json<ApiError>)> {
+    let sku = input.sku.trim();
+    let name = input.name.trim();
+
+    validate_product(sku, name, input.gst_rate)?;
+
+    let product = sqlx::query_as::<_, Product>(
+        r#"
+        INSERT INTO public.products (
+            sku,
+            name,
+            generic_name,
+            brand_name,
+            dosage_form,
+            strength,
+            pack_size,
+            unit,
+            hsn_code,
+            gst_rate,
+            barcode,
+            is_prescription_required,
+            is_active
+        )
+        VALUES (
+            $1, $2, $3, $4, $5, $6, $7,
+            COALESCE($8, 'PCS'),
+            $9,
+            COALESCE($10, 0),
+            $11,
+            COALESCE($12, false),
+            COALESCE($13, true)
+        )
+        RETURNING
+            id, sku, name, generic_name, brand_name,
+            dosage_form, strength, pack_size, unit,
+            hsn_code, gst_rate, barcode,
+            is_prescription_required, is_active
+        "#,
+    )
+    .bind(sku)
+    .bind(name)
+    .bind(input.generic_name)
+    .bind(input.brand_name)
+    .bind(input.dosage_form)
+    .bind(input.strength)
+    .bind(input.pack_size)
+    .bind(input.unit)
+    .bind(input.hsn_code)
+    .bind(input.gst_rate)
+    .bind(input.barcode)
+    .bind(input.is_prescription_required)
+    .bind(input.is_active)
+    .fetch_one(&pool)
+    .await
+    .map_err(write_error)?;
+
+    Ok((StatusCode::CREATED, Json(product)))
+}
+
+// ─────────────────────────────────────────────
+// PUT /api/products/{id}
+// Update an existing product.
+// ─────────────────────────────────────────────
+
+pub async fn update_product(
+    State(pool): State<PgPool>,
+    Path(id): Path<Uuid>,
+    Json(input): Json<ProductInput>,
+) -> Result<Json<Product>, (StatusCode, Json<ApiError>)> {
+    let sku = input.sku.trim();
+    let name = input.name.trim();
+
+    validate_product(sku, name, input.gst_rate)?;
+
+    let product = sqlx::query_as::<_, Product>(
+        r#"
+        UPDATE public.products
+        SET
+            sku = $2,
+            name = $3,
+            generic_name = $4,
+            brand_name = $5,
+            dosage_form = $6,
+            strength = $7,
+            pack_size = $8,
+            unit = COALESCE($9, 'PCS'),
+            hsn_code = $10,
+            gst_rate = COALESCE($11, 0),
+            barcode = $12,
+            is_prescription_required = COALESCE($13, false),
+            is_active = COALESCE($14, true),
+            updated_at = NOW()
+        WHERE id = $1
+        RETURNING
+            id, sku, name, generic_name, brand_name,
+            dosage_form, strength, pack_size, unit,
+            hsn_code, gst_rate, barcode,
+            is_prescription_required, is_active
+        "#,
+    )
+    .bind(id)
+    .bind(sku)
+    .bind(name)
+    .bind(input.generic_name)
+    .bind(input.brand_name)
+    .bind(input.dosage_form)
+    .bind(input.strength)
+    .bind(input.pack_size)
+    .bind(input.unit)
+    .bind(input.hsn_code)
+    .bind(input.gst_rate)
+    .bind(input.barcode)
+    .bind(input.is_prescription_required)
+    .bind(input.is_active)
+    .fetch_optional(&pool)
+    .await
+    .map_err(write_error)?
+    .ok_or_else(not_found)?;
+
+    Ok(Json(product))
+}
+
+// ─────────────────────────────────────────────
+// DELETE /api/products/{id}
+// Delete a product if database constraints allow.
+// ─────────────────────────────────────────────
+
+pub async fn delete_product(
+    State(pool): State<PgPool>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    let result = sqlx::query("DELETE FROM public.products WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .map_err(write_error)?;
+
+    if result.rows_affected() == 0 {
+        return Err(not_found());
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ─────────────────────────────────────────────
+// Validation
+// ─────────────────────────────────────────────
+
+fn validate_product(
+    sku: &str,
+    name: &str,
+    gst_rate: Option<Decimal>,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    if sku.is_empty() || name.is_empty() {
+        return Err(bad_request("SKU and product name are required"));
+    }
+
+    if let Some(rate) = gst_rate {
+        if rate < Decimal::ZERO || rate > Decimal::from(100) {
+            return Err(bad_request("GST rate must be between 0 and 100"));
+        }
+    }
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────
+// Error responses
+// ─────────────────────────────────────────────
+
+fn bad_request(message: &str) -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ApiError {
+            error: message.to_owned(),
+        }),
+    )
+}
+
+fn not_found() -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ApiError {
+            error: "Product not found".to_owned(),
+        }),
+    )
+}
+
+fn internal_error(error: sqlx::Error) -> (StatusCode, Json<ApiError>) {
+    tracing::error!("Product query failed: {error}");
+
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ApiError {
+            error: "Database query failed".to_owned(),
+        }),
+    )
+}
+
+fn write_error(error: sqlx::Error) -> (StatusCode, Json<ApiError>) {
+    if let sqlx::Error::Database(ref db_error) = error {
+        if db_error.is_unique_violation() {
+            return (
+                StatusCode::CONFLICT,
+                Json(ApiError {
+                    error: "SKU or another unique field already exists".to_owned(),
+                }),
+            );
+        }
+
+        if db_error.is_foreign_key_violation() {
+            return (
+                StatusCode::CONFLICT,
+                Json(ApiError {
+                    error:
+                        "Product is referenced by another record and cannot be changed or deleted"
+                            .to_owned(),
+                }),
+            );
+        }
+    }
+
+    tracing::error!("Product write failed: {error}");
+
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ApiError {
+            error: "Product operation failed".to_owned(),
+        }),
+    )
+}
